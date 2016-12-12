@@ -1,16 +1,18 @@
-Source: katldal
-Section: science
+Source: katdal
+Section: python
 Priority: optional
 Maintainer: Gijs Molenaar <gijs@pythonic.nl>
-Build-Depends: debhelper (>= 8.0.0)
+Build-Depends: debhelper (>= 9), dh-python, python-all, python-setuptools,
+ python-katversion, python-katpoint
 Standards-Version: 3.9.4
 Homepage: https://github.com/ska-sa/katdal
 Vcs-Git: git://github.com/kernsuite-debian/katdal.git
 Vcs-Browser: https://github.com/kernsuite-debian/katdal
+X-Python-Version: >= 2.7
 
-Package: python-katldal
+Package: python-katdal
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${python:Depends}
 Description: Data access library for the MeerKAT project 
  This package serves as a data access library to the HDF5 files produced by the
  Fringe Finder, KAT-7 and MeerKAT data capturing systems. It uses memory
