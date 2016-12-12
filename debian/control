@@ -1,0 +1,20 @@
+Source: katldal
+Section: science
+Priority: optional
+Maintainer: Gijs Molenaar <gijs@pythonic.nl>
+Build-Depends: debhelper (>= 8.0.0)
+Standards-Version: 3.9.4
+Homepage: https://github.com/ska-sa/katdal
+Vcs-Git: git://github.com/kernsuite-debian/katdal.git
+Vcs-Browser: https://github.com/kernsuite-debian/katdal
+
+Package: python-katldal
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Data access library for the MeerKAT project 
+ This package serves as a data access library to the HDF5 files produced by the
+ Fringe Finder, KAT-7 and MeerKAT data capturing systems. It uses memory
+ carefully, allowing files to be inspected and partially loaded into memory.
+ Data sets may be concatenated and split via a flexible selection mechanism.
+ In addition, it provides a script to convert these HDF5 files to CASA
+ MeasurementSets.
