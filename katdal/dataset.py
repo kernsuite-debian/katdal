@@ -114,7 +114,8 @@ class SpectralWindow(object):
     channel width. The channels are assumed to be regularly spaced and to be the
     result of either lower-sideband downconversion (channel frequencies
     decreasing with channel index) or upper-sideband downconversion (frequencies
-    increasing with index).
+    increasing with index). For further information the receiver band and
+    correlator product names are also available.
 
     Parameters
     ----------
@@ -125,9 +126,11 @@ class SpectralWindow(object):
     num_chans : int
         Number of frequency channels
     product : string, optional
-        Data product / correlator mode
+        Name of data product / correlator mode
     sideband : {-1, +1}, optional
         Type of downconversion (-1 => lower sideband, +1 => upper sideband)
+    band : {'L', 'UHF', 'S', 'X', 'Ku'}, optional
+        Name of receiver / band
 
     Attributes
     ----------
@@ -135,19 +138,24 @@ class SpectralWindow(object):
         Centre frequency of each frequency channel (assuming LSB mixing), in Hz
 
     """
-    def __init__(self, centre_freq, channel_width, num_chans, product=None, sideband=-1):
+    def __init__(self, centre_freq, channel_width, num_chans, product=None,
+                 sideband=-1, band='L'):
         self.centre_freq = centre_freq
         self.channel_width = channel_width
         self.num_chans = num_chans
         self.product = product if product is not None else ''
+        self.band = band
         # Don't subtract half a channel width as channel 0 is centred on 0 Hz in baseband
         self.channel_freqs = centre_freq + sideband * channel_width * (np.arange(num_chans) - num_chans / 2)
 
     def __repr__(self):
         """Short human-friendly string representation of spectral window object."""
-        return "<katdal.SpectralWindow product='%s' centre=%.3f MHz bandwidth=%.3f MHz channels=%d at 0x%x>" % \
-               (self.product, self.centre_freq / 1e6,
-                self.num_chans * self.channel_width / 1e6, self.num_chans, id(self))
+        return "<katdal.SpectralWindow %s-band product=%s centre=%.3f MHz " \
+               "bandwidth=%.3f MHz channels=%d at 0x%x>" % \
+               (self.band if self.band else 'unknown',
+                repr(self.product) if self.product else 'unknown',
+                self.centre_freq / 1e6, self.num_chans * self.channel_width / 1e6,
+                self.num_chans, id(self))
 
     def __eq__(self, other):
         """Equality comparison operator."""
@@ -404,6 +412,8 @@ class DataSet(object):
         self._time_keep = []
         self._freq_keep = []
         self._corrprod_keep = []
+        self._weights_keep = 'all'
+        self._flags_keep = 'all'
 
     def __repr__(self):
         """Short human-friendly string representation of data set object."""
@@ -415,7 +425,7 @@ class DataSet(object):
         descr = ['===============================================================================',
                  'Name: %s (version %s)' % (self.name, self.version),
                  '===============================================================================',
-                 'Observer: %s  Experiment ID: %s' % (self.observer if self.observer else 'unknown',
+                 'Observer: %s  Experiment ID: %s' % (self.observer if self.observer else '-',
                                                       self.experiment_id if self.experiment_id else '-'),
                  "Description: '%s'" % (self.description if self.description else 'No description',),
                  'Observed from %s to %s' % (self.start_time.local(), self.end_time.local()),
@@ -427,10 +437,12 @@ class DataSet(object):
             descr.append('  %2d  %28s  %2d      %3d' %
                          (n, ant_names.ljust(7 * 4 + 6), len(sub.inputs), len(sub.corr_products)))
         descr += ['Spectral Windows: %d' % (len(self.spectral_windows),),
-                  '  ID  Product    CentreFreq(MHz)  Bandwidth(MHz)  Channels  ChannelWidth(kHz)']
+                  '  ID Band Product  CentreFreq(MHz)  Bandwidth(MHz)  Channels  ChannelWidth(kHz)']
         for n, spw in enumerate(self.spectral_windows):
-            descr.append('  %2d  %-11s %8.3f         %7.3f         %5d     %8.3f' %
-                         (n, spw.product, spw.centre_freq / 1e6, spw.channel_width / 1e6 * spw.num_chans,
+            descr.append('  %2d %-4s %-9s %9.3f        %8.3f          %5d     %9.3f' %
+                         (n, spw.band if spw.band else '-', spw.product if spw.product else '-',
+                          spw.centre_freq / 1e6,
+                          spw.channel_width / 1e6 * spw.num_chans,
                           spw.num_chans, spw.channel_width / 1e3))
         # Now add dynamic information, which depends on the current selection criteria
         descr += ['-------------------------------------------------------------------------------',
@@ -516,10 +528,12 @@ class DataSet(object):
                 model.min_freq_MHz = new_min_freq
                 model.max_freq_MHz = new_max_freq
 
-    def _set_keep(self, time_keep=None, freq_keep=None, corrprod_keep=None):
+    def _set_keep(self, time_keep=None, freq_keep=None, corrprod_keep=None,
+                  weights_keep=None, flags_keep=None):
         """Set time, frequency and/or correlation product selection masks.
 
-        Set the selection masks for those parameters that are present.
+        Set the selection masks for those parameters that are present. Also
+        include weights and flags selections as options.
 
         Parameters
         ----------
@@ -529,6 +543,10 @@ class DataSet(object):
             Boolean selection mask with one entry per frequency channel
         corrprod_keep : array of bool, shape (*B*,), optional
             Boolean selection mask with one entry per correlation product
+        weights_keep : 'all' or string or sequence of strings, optional
+            Names of selected weight types (or 'all' for the lot)
+        flags_keep : 'all' or string or sequence of strings, optional
+            Names of selected flag types (or 'all' for the lot)
 
         """
         if time_keep is not None:
@@ -540,6 +558,10 @@ class DataSet(object):
             self._freq_keep = freq_keep
         if corrprod_keep is not None:
             self._corrprod_keep = corrprod_keep
+        if weights_keep is not None:
+            self._weights_keep = weights_keep
+        if flags_keep is not None:
+            self._flags_keep = flags_keep
 
     def select(self, **kwargs):
         """Select subset of data, based on time / frequency / corrprod filters.
@@ -573,6 +595,10 @@ class DataSet(object):
 
         If :meth:`select` is called without any parameters the selection is
         reset to the original data set.
+
+        In addition, the *weights* and *flags* criteria are lists of names that
+        select which weights and flags to include in the corresponding data set
+        property.
 
         Parameters
         ----------
@@ -616,6 +642,13 @@ class DataSet(object):
         pol : {'H', 'V', 'HH', 'VV', 'HV', 'VH'}, optional
             Select polarisation term
 
+        weights : 'all' or string or sequence of strings, optional
+            List of names of weights to be multiplied together, as a sequence
+            or string of comma-separated names (combine all weights by default)
+        flags : 'all' or string or sequence of strings, optional
+            List of names of flags that will be OR'ed together, as a sequence
+            or string of comma-separated names (use all flags by default)
+
         reset : {'auto', '', 'T', 'F', 'B', 'TF', 'TB', 'FB', 'TFB'}, optional
             Remove existing selections on specified dimensions before applying
             the new selections. The default 'auto' option clears those dimensions
@@ -636,7 +669,8 @@ class DataSet(object):
         freq_selectors = ['channels', 'freqrange']
         corrprod_selectors = ['corrprods', 'ants', 'inputs', 'pol']
         # Check if keywords are valid and raise exception only if this is explicitly enabled
-        valid_kwargs = time_selectors + freq_selectors + corrprod_selectors + ['spw', 'subarray', 'reset', 'strict']
+        valid_kwargs = time_selectors + freq_selectors + corrprod_selectors + \
+            ['spw', 'subarray', 'weights', 'flags', 'reset', 'strict']
         # Check for definition of strict
         strict = kwargs.get('strict', True)
         if strict and set(kwargs.keys()) - set(valid_kwargs):
@@ -774,9 +808,14 @@ class DataSet(object):
                 polAB = polAB * 2 if polAB in ('h', 'v') else polAB
                 self._corrprod_keep &= [(inpA[-1] == polAB[0] and inpB[-1] == polAB[1])
                                         for inpA, inpB in self.subarrays[self.subarray].corr_products]
+            # Selections that affect weights and flags
+            elif k == 'weights':
+                self._weights_keep = v
+            elif k == 'flags':
+                self._flags_keep = v
 
         # Ensure that updated selections make their way to sensor cache and potentially underlying datasets
-        self._set_keep(self._time_keep, self._freq_keep, self._corrprod_keep)
+        self._set_keep(self._time_keep, self._freq_keep, self._corrprod_keep, self._weights_keep, self._flags_keep)
         # Update the relevant data members based on selection made
         # These would all be more efficient as properties, but at the expense of extra lines of code...
         self.shape = (self._time_keep.sum(), self._freq_keep.sum(), self._corrprod_keep.sum())
@@ -903,40 +942,32 @@ class DataSet(object):
         """
         raise NotImplementedError
 
-    def weights(self, names=None):
+    @property
+    def weights(self):
         """Visibility weights as a function of time, frequency and baseline.
 
-        Parameters
-        ----------
-        names : None or string or sequence of strings, optional
-            List of names of weights to be multiplied together, as a sequence
-            or string of comma-separated names (combine all weights by default)
-
-        Returns
-        -------
-        weights : array-like of float32, shape (*T*, *F*, *B*)
-            Array of weights with time along the first dimension, frequency along
-            the second dimension and correlation product ("baseline") index
-            along the third dimension
+        The weights data are returned as an array indexer of float32, shape
+        (*T*, *F*, *B*), with time along the first dimension, frequency along the
+        second dimension and correlation product ("baseline") index along the
+        third dimension. The number of integrations *T* matches the length of
+        :meth:`timestamps`, the number of frequency channels *F* matches the
+        length of :meth:`freqs` and the number of correlation products *B*
+        matches the length of :meth:`corr_products`.
 
         """
         raise NotImplementedError
 
-    def flags(self, names=None):
+    @property
+    def flags(self):
         """Visibility flags as a function of time, frequency and baseline.
 
-        Parameters
-        ----------
-        names : None or string or sequence of strings, optional
-            List of names of flags that will be OR'ed together, as a sequence or
-            a string of comma-separated names (use all flags by default)
-
-        Returns
-        -------
-        flags : array-like of bool, shape (*T*, *F*, *B*)
-            Array of flags with time along the first dimension, frequency along
-            the second dimension and correlation product ("baseline") index
-            along the third dimension
+        The flags data are returned as an array indexer of bool, shape
+        (*T*, *F*, *B*), with time along the first dimension, frequency along the
+        second dimension and correlation product ("baseline") index along the
+        third dimension. The number of integrations *T* matches the length of
+        :meth:`timestamps`, the number of frequency channels *F* matches the
+        length of :meth:`freqs` and the number of correlation products *B*
+        matches the length of :meth:`corr_products`.
 
         """
         raise NotImplementedError
