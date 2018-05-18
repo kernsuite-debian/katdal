@@ -7,13 +7,6 @@ export PYBUILD_NAME=katdal
 %:
 	dh $@ --with python2 --buildsystem=pybuild
 
-override_dh_auto_install:
-	dh_auto_install
-	mkdir -p debian/python-katdal/var/kat/static/
-	cd debian/python-katdal/var/kat/static/ && tar zxvf ../../../../../blank.ms.tgz
-
-
-
 override_dh_auto_clean:
 	dh_clean
 	rm -rf .eggs

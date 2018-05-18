@@ -1,3 +1,9 @@
+katdal (0.10-1kern1) bionic; urgency=medium
+
+  * New upstream version 0.10
+
+ -- KERN packaging <packaging@kernsuite.info>  Fri, 18 May 2018 07:44:01 +0000
+
 katdal (0.8-1kern1) xenial; urgency=medium
 
   * make debian files mit
