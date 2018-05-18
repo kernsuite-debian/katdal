@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2016, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -397,7 +397,7 @@ class DataSet(object):
         self.channels = np.empty(0, dtype=np.int)
 
         self.dump_period = 0.0
-        self.sensor = None
+        self.sensor = {}
         self.catalogue = katpoint.Catalogue()
         self.start_time = katpoint.Timestamp(0.0)
         self.end_time = katpoint.Timestamp(0.0)
@@ -524,10 +524,10 @@ class DataSet(object):
                max_freq < 1.6 * model.max_freq_MHz:
                 new_min_freq = min(min_freq, model.min_freq_MHz)
                 new_max_freq = max(max_freq, model.max_freq_MHz)
-                logger.warn('Extending flux density model frequency range of '
-                            '%r from %d-%d MHz to %d-%d MHz', target.name,
-                            model.min_freq_MHz, model.max_freq_MHz,
-                            new_min_freq, new_max_freq)
+                logger.warning('Extending flux density model frequency range '
+                               'of %r from %d-%d MHz to %d-%d MHz', target.name,
+                               model.min_freq_MHz, model.max_freq_MHz,
+                               new_min_freq, new_max_freq)
                 model.min_freq_MHz = new_min_freq
                 model.max_freq_MHz = new_max_freq
 
@@ -555,7 +555,7 @@ class DataSet(object):
         if time_keep is not None:
             self._time_keep = time_keep
             # Ensure that sensor cache gets updated time selection
-            if self.sensor is not None:
+            if self.sensor:
                 self.sensor._set_keep(self._time_keep)
         if freq_keep is not None:
             self._freq_keep = freq_keep
@@ -642,8 +642,9 @@ class DataSet(object):
             Select antennas by name or object
         inputs : string or sequence of strings, optional
             Select inputs by label
-        pol : {'H', 'V', 'HH', 'VV', 'HV', 'VH'}, optional
-            Select polarisation term
+        pol : string or sequence of strings
+              {'H', 'V', 'HH', 'VV', 'HV', 'VH'}, optional
+            Select polarisation terms
 
         weights : 'all' or string or sequence of strings, optional
             List of names of weights to be multiplied together, as a sequence
@@ -807,10 +808,24 @@ class DataSet(object):
                 self._corrprod_keep &= [(inpA in inps and inpB in inps)
                                         for inpA, inpB in self.subarrays[self.subarray].corr_products]
             elif k == 'pol':
-                polAB = v.lower()
-                polAB = polAB * 2 if polAB in ('h', 'v') else polAB
-                self._corrprod_keep &= [(inpA[-1] == polAB[0] and inpB[-1] == polAB[1])
-                                        for inpA, inpB in self.subarrays[self.subarray].corr_products]
+                pols = [i.strip() for i in v.split(',')] if isinstance(v, basestring) else v if is_iterable(v) else [v]
+                # Lower case and strip out empty strings
+                pols = [i.lower() for i in pols if i]
+
+                # Proceed if we have a selection
+                if len(pols) > 0:
+                    # If given a selection assume we keep nothing
+                    keep = np.zeros(self._corrprod_keep.shape, dtype=np.bool)
+
+                    # or separate polarisation selections together
+                    for polAB in pols:
+                        polAB = polAB * 2 if polAB in ('h', 'v') else polAB
+                        keep |= [(inpA[-1] == polAB[0] and inpB[-1] == polAB[1])
+                                               for inpA, inpB in self.subarrays[self.subarray].corr_products]
+
+                    # and into final corrprod selection
+                    self._corrprod_keep &= keep
+
             # Selections that affect weights and flags
             elif k == 'weights':
                 self._weights_keep = v
