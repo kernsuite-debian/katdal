@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2016, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -30,7 +30,7 @@ except ImportError:
 from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray, SpectralWindow,
                       DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS, _robust_target)
 from .sensordata import (SensorCache, RecordSensorData,
-                         H5TelstateSensorData)
+                         H5TelstateSensorData, pickle_loads)
 from .categorical import CategoricalData
 from .lazy_indexer import LazyIndexer, LazyTransform
 
@@ -45,11 +45,11 @@ SENSOR_PROPS = dict(DEFAULT_SENSOR_PROPS)
 SENSOR_PROPS.update({
     '*activity': {'greedy_values': ('slew', 'stop'), 'initial_value': 'slew',
                   'transform': lambda act: SIMPLIFY_STATE.get(act, 'stop')},
-    '*target': {'initial_value': '', 'transform': _robust_target},
     '*ap_indexer_position': {'initial_value': ''},
-    '*_serial_number': {'initial_value': 0},
-    '*dig_noise_diode': {'categorical': True, 'greedy_values': (True,),
-                         'initial_value': 0.0, 'transform': lambda x: x > 0.0},
+    '*noise_diode': {'categorical': True, 'greedy_values': (True,),
+                     'initial_value': 0.0, 'transform': lambda x: x > 0.0},
+    '*serial_number': {'initial_value': 0},
+    '*target': {'initial_value': '', 'transform': _robust_target},
 })
 
 SENSOR_ALIASES = {
@@ -62,6 +62,7 @@ def _calc_azel(cache, name, ant):
     real_sensor = 'Antennas/%s/%s' % (ant, 'pos_actual_scan_azim' if name.endswith('az') else 'pos_actual_scan_elev')
     cache[name] = sensor_data = katpoint.deg2rad(cache.get(real_sensor))
     return sensor_data
+
 
 VIRTUAL_SENSORS = dict(DEFAULT_VIRTUAL_SENSORS)
 VIRTUAL_SENSORS.update({'Antennas/{ant}/az': _calc_azel, 'Antennas/{ant}/el': _calc_azel})
@@ -111,6 +112,10 @@ def dummy_dataset(name, shape, dtype, value):
     return dummy_file.create_dataset(name, shape=shape, maxshape=shape,
                                      dtype=dtype, fillvalue=value, compression='gzip')
 
+
+class _AttributeFound(Exception):
+    """This indicates that an attribute has been found and contains its value."""
+
 # -------------------------------------------------------------------------------------------------
 # -- CLASS :  H5DataV3
 # -------------------------------------------------------------------------------------------------
@@ -151,6 +156,8 @@ class H5DataV3(DataSet):
     ----------
     file : :class:`h5py.File` object
         Underlying HDF5 file, exposed via :mod:`h5py` interface
+    stream_name : string
+        Name of L0 data stream, for finding corresponding telescope state keys
 
     Notes
     -----
@@ -173,10 +180,13 @@ class H5DataV3(DataSet):
 
         # Load main HDF5 groups
         data_group, tm_group = f['Data'], f['TelescopeModel']
+        self.stream_name = str(data_group.attrs.get('stream_name', 'sdp_l0'))
         # Pick first group with appropriate class as CBF
         cbfs = [comp for comp in tm_group
                 if tm_group[comp].attrs.get('class') == 'CorrelatorBeamformer']
         cbf_group = tm_group[cbfs[0]]
+        # Get SDP group, if present
+        sdp_group = tm_group.get('sdp')
 
         # ------ Extract sensors ------
 
@@ -209,12 +219,9 @@ class H5DataV3(DataSet):
 
         # ------ Extract vis and timestamps ------
 
-        if cbf_group.attrs.keys() == ['class']:
-            raise BrokenFile('File contains no correlator metadata')
         # Get SDP L0 dump period if available, else fall back to CBF dump period
-        self.dump_period = cbf_dump_period = cbf_group.attrs['int_time']
-        if 'sdp' in tm_group:
-            self.dump_period = tm_group['sdp'].attrs.get('l0_int_time', self.dump_period)
+        cbf_dump_period = cbf_group.attrs.get('int_time')
+        self.dump_period = self._get_l0_attr('int_time', cbf_group, sdp_group)
         # Determine if timestamps are already aligned with middle of dumps
         try:
             ts_ref = data_group['timestamps'].attrs['timestamp_reference']
@@ -225,6 +232,8 @@ class H5DataV3(DataSet):
             #   - RTS: SDP dump = CBF dump, timestamps at start of each dump
             #   - Early AR1 (before Oct 2015): SDP dump = mean of starts of CBF dumps
             # Fortunately, both result in the same offset of 1/2 a CBF dump
+            if cbf_dump_period is None:
+                raise BrokenFile('Timestamps are not centred and CBF dump period unknown')
             offset_to_middle_of_dump = 0.5 * cbf_dump_period
         # Obtain visibilities and timestamps (load the latter explicitly, but obviously not the former...)
         if 'correlator_data' in data_group:
@@ -234,9 +243,11 @@ class H5DataV3(DataSet):
         self._timestamps = data_group['timestamps'][:]
         self._keepdims = keepdims
 
-        # Resynthesise timestamps from sample counter based on a different scale factor or origin
-        old_scale = cbf_group.attrs['scale_factor_timestamp']
-        old_origin = cbf_group.attrs['sync_time']
+        # Resynthesise timestamps from sample counter based on a different
+        # scale factor or origin. For this we need to get the CBF scale factor
+        # and origin, ignoring any SDP parameters.
+        old_scale = self._get_cbf_attr('scale_factor_timestamp', cbf_group)
+        old_origin = self._get_cbf_attr('sync_time', cbf_group)
         # If no new scale factor or origin is given, just use old ones - timestamps should be identical
         time_scale = old_scale if time_scale is None else time_scale
         time_origin = old_origin if time_origin is None else time_origin
@@ -292,14 +303,18 @@ class H5DataV3(DataSet):
         # Discard the last sample if the timestamp is a duplicate (caused by stop packet in k7_capture)
         num_dumps = (num_dumps - 1) if num_dumps > 1 and (self._timestamps[-1] == self._timestamps[-2]) else num_dumps
         self._timestamps = self._timestamps[:num_dumps]
-        # The expected_dumps should always be an integer (like num_dumps), unless the timestamps and/or dump period
-        # are messed up in the file, so the threshold of this test is a bit arbitrary (e.g. could use > 0.5)
-        expected_dumps = (self._timestamps[-1] - self._timestamps[0]) / self.dump_period + 1
-        if abs(expected_dumps - num_dumps) >= 0.01:
-            # Warn the user, as this is anomalous
-            logger.warning(("Irregular timestamps detected in file '%s': "
-                           "expected %.3f dumps based on dump period and start/end times, got %d instead") %
-                           (filename, expected_dumps, num_dumps))
+        # The expected_dumps should always be an integer (like num_dumps),
+        # unless the timestamps and/or dump period are messed up in the file,
+        # so the threshold of this test is a bit arbitrary (e.g. could use > 0.5).
+        # The last dump might only be partially filled by ingest, so ignore it.
+        if num_dumps > 1:
+            expected_dumps = (self._timestamps[-2] - self._timestamps[0]) / self.dump_period + 2
+            if abs(expected_dumps - num_dumps) >= 0.01:
+                # Warn the user, as this is anomalous
+                logger.warning("Irregular timestamps detected in file '%s': "
+                               "expected %.3f dumps based on dump period and "
+                               "start/end times, got %d instead",
+                               filename, expected_dumps, num_dumps)
         # Ensure timestamps are aligned with the middle of each dump
         self._timestamps += offset_to_middle_of_dump + self.time_offset
         if self._timestamps[0] < 1e9:
@@ -338,15 +353,21 @@ class H5DataV3(DataSet):
         # ------ Extract observation parameters and script log ------
 
         self.obs_params = {}
-        # Replay obs_params sensor if available and update obs_params dict accordingly
-        try:
-            obs_params = self.sensor.get('Observation/params', extract=False)['value']
-        except KeyError:
-            obs_params = []
-        for obs_param in obs_params:
-            if obs_param:
-                key, val = obs_param.split(' ', 1)
-                self.obs_params[key] = np.lib.utils.safe_eval(val)
+        # obs_params is a telstate attribute in v3.9 so try that first
+        if 'capture_block_id' in f.attrs:
+            attr_name = f.attrs['capture_block_id'] + '_obs_params'
+            self.obs_params = self._get_telstate_attr(attr_name, {})
+        else:
+            try:
+                # Replay obs_params sensor if available
+                obs_params = self.sensor.get('Observation/params',
+                                             extract=False)['value']
+            except KeyError:
+                obs_params = []
+            for obs_param in obs_params:
+                if obs_param:
+                    key, val = obs_param.split(' ', 1)
+                    self.obs_params[key] = np.lib.utils.safe_eval(val)
         # Get observation script parameters, with defaults
         self.observer = self.obs_params.get('observer', '')
         self.description = self.obs_params.get('description', '')
@@ -376,7 +397,7 @@ class H5DataV3(DataSet):
         ants = sorted(ants)
         cam_ants = set(ant.name for ant in ants)
         # Original list of correlation products as pairs of input labels
-        corrprods = self._get_corrprods(f)
+        corrprods = self._get_corrprods(f, self.stream_name)
         # Find names of all antennas with associated correlator data
         cbf_ants = set([cp[0][:-1] for cp in corrprods] + [cp[1][:-1] for cp in corrprods])
         # By default, only pick antennas that were in use by the script
@@ -408,16 +429,8 @@ class H5DataV3(DataSet):
         if not band:
             if 'TelescopeState' in f.file:
                 # Newer RTS, AR1 and beyond use the subarray band attribute / sensor
-                try:
-                    band = f.file['TelescopeState'].attrs['sub_band']
-                    # The telstate attributes were serialised via str() until 2016-11-29
-                    if band not in ('l', 's', 'u', 'x'):
-                        band = pickle.loads(band)
-                except (KeyError, pickle.UnpicklingError):
-                    try:
-                        band = self.sensor['TelescopeState/sub_band'][-1]
-                    except KeyError:
-                        band = ''
+                band = self._get_telstate_attr('sub_band', default='',
+                                               no_unpickle=('l', 's', 'u', 'x'))
             else:
                 # Fallback for the original RTS before 2016-07-21 (not reliable)
                 # Find the most common valid indexer position in the subarray
@@ -441,12 +454,27 @@ class H5DataV3(DataSet):
         if not band:
             logger.warning('Could not figure out receiver band - '
                            'please provide it via band parameter')
-        # Populate antenna -> receiver mapping
+        # Populate antenna -> receiver mapping and figure out noise diode
         for ant in cam_ants:
-            rx_sensor = 'Antennas/%s/rsc_rx%s_serial_number' % (ant, band)
-            rx_serial = self.sensor[rx_sensor][0] if rx_sensor in self.sensor else 0
+            rx_sensor_options = (
+                # Since 2018-01-16 MKAT / ARx only has this version
+                'TelescopeState/%s_rsc_rx%s_serial_number' % (ant, band),
+                # RTS since 2017-11-15
+                'TelescopeState/%s_rx_serial_number' % (ant,),
+                # Original TelescopeModel version
+                'Antennas/%s/rsc_rx%s_serial_number' % (ant, band))
+            rx_serial = 0
+            for rx_sensor in rx_sensor_options:
+                if rx_sensor in self.sensor:
+                    rx_serial = self.sensor[rx_sensor][0]
+                    break
             if band:
                 self.receivers[ant] = '%s.%d' % (band, rx_serial)
+            nd_sensor = 'TelescopeState/%s_dig_%s_band_noise_diode' % (ant, band)
+            if nd_sensor in self.sensor:
+                # A sensor alias would be ideal for this but it only deals with suffixes ATM
+                new_nd_sensor = 'Antennas/%s/nd_coupler' % (ant,)
+                self.sensor[new_nd_sensor] = self.sensor.get(nd_sensor, extract=False)
         # Mapping describing current receiver information on MeerKAT
         # XXX Update this as new receivers come online
         rx_table = {
@@ -458,9 +486,8 @@ class H5DataV3(DataSet):
             'x': dict(band='Ku', sideband=1),
         }
         spw_params = rx_table.get(band, dict(band='', sideband=1))
-        # XXX Cater for future narrowband mode at some stage
-        num_chans = cbf_group.attrs['n_chans']
-        bandwidth = cbf_group.attrs['bandwidth']
+        num_chans = self._get_l0_attr('n_chans', cbf_group, sdp_group)
+        bandwidth = self._get_l0_attr('bandwidth', cbf_group, sdp_group)
         # Work around a bc856M4k CBF bug active from 2016-04-28 to 2016-06-01 that got the bandwidth wrong
         if bandwidth == 857152196.0:
             logger.warning('Worked around CBF bandwidth bug (857.152 MHz -> 856.000 MHz)')
@@ -481,12 +508,16 @@ class H5DataV3(DataSet):
         elif spw_params['band'] == 'UHF' and bandwidth == 856e6:
             spw_params['centre_freq'] = 428e6
             spw_params['sideband'] = -1
-        # Get channel width from original CBF parameters
+        l0_centre_freq = self._get_l0_attr('center_freq', sdp_group=sdp_group,
+                                           required=False)
+        if l0_centre_freq is not None:
+            spw_params['centre_freq'] = l0_centre_freq
+        # Get channel width from original CBF / SDP parameters
         spw_params['channel_width'] = bandwidth / num_chans
         # Continue with different channel count, but invalidate centre freq (keep channel width though)
         if num_chans != self._vis.shape[1]:
-            logger.warning('Number of channels received from correlator (%d) differs '
-                           'from number of channels in data (%d) - trusting the latter',
+            logger.warning('Number of channels reported in metadata (%d) differs '
+                           'from actual number of channels in data (%d) - trusting the latter',
                            num_chans, self._vis.shape[1])
             num_chans = self._vis.shape[1]
             spw_params.pop('centre_freq', None)
@@ -559,14 +590,155 @@ class H5DataV3(DataSet):
         # Apply default selection and initialise all members that depend on selection in the process
         self.select(spw=0, subarray=0, ants=obs_ants)
 
+    def _get_telstate_attr(self, key, default=None, no_unpickle=()):
+        """Retrieve an attribute from the TelescopeState.
+
+        If there is no TelescopeState group, the key is missing, or it cannot
+        be unpickled, returns `default` instead.
+
+        If the raw value is a member of `no_unpickle`, returns it directly
+        rather than attempting to unpickle it. This is to support older files
+        (created before 2016-11-30) in which the attributes were not pickled.
+        """
+        try:
+            value = self.file['TelescopeState'].attrs[key]
+            return pickle_loads(value, no_unpickle)
+        except (KeyError, pickle.UnpicklingError):
+            # In some cases the value is placed in a sensor instead. Return
+            # the most recent value.
+            try:
+                return self.sensor['TelescopeState/' + key][-1]
+            except (KeyError, IndexError):
+                return default
+
+    def _raise_if_attr_found(self, *attr_name_parts, **kwargs):
+        """Look for attribute and if found, return value by raising exception.
+
+        Parameters
+        ----------
+        attr_name_parts : sequence of strings
+            Join these with '_' to form attribute name (last part is base name)
+        h5_group : :class:`h5py.Group`, optional, keyword-only
+            HDF5 group in TelescopeModel to use instead of TelescopeState
+
+        Raises
+        ------
+        _AttributeFound(value)
+            If attribute is found, return value via exception (else do nothing)
+        """
+        attr_name = '_'.join(attr_name_parts)
+        key = attr_name_parts[-1]
+        h5_group = kwargs.get('h5_group')
+        if h5_group is not None:
+            try:
+                value = h5_group.attrs[attr_name]
+            except KeyError:
+                pass
+            else:
+                logger.debug("Found %s=%s in h5.file[%r].attrs[%r]",
+                             key, value, h5_group.name, attr_name)
+                raise _AttributeFound(value)
+        else:
+            NOTFOUND = object()     # Dummy to distinguish "not found" from None
+            value = self._get_telstate_attr(attr_name, NOTFOUND)
+            if value is not NOTFOUND:
+                logger.debug('Found %s=%s in telstate[%r]', key, value, attr_name)
+                raise _AttributeFound(value)
+
+    def _get_cbf_attr(self, key, cbf_group=None, required=True, default=None):
+        """Retrieve attribute associated with the CBF stream.
+
+        It is searched for in several places, using the first match from the
+        following:
+
+        - :samp:`{stream_name}_{key}` in TelescopeState, for each stream
+          upstream from the SDP output stream (considering the first in a list
+          only each time).
+        - :samp:`{instrument}_{key}` in TelescopeState, where `instrument`
+          is the CBF instrument of the root stream.
+        - :samp:`cbf_{key}` in TelescopeState, if `cbf_group` is given
+        - :samp:`{key}` in `cbf_group` in TelescopeModel, if given
+        - `default`, unless `required` is true
+
+        Parameters
+        ----------
+        key : string
+            Base name of the attribute
+        cbf_group : :class:`h5py.Group`, optional
+            HDF5 group for the CBF in TelescopeModel
+        required : bool, optional
+            If true (default), raise :exc:`BrokenFile` if the key is not found
+        default : object, optional
+            Value to return if the key is not found and `required` is false
+        """
+        srcs = self._get_telstate_attr(self.stream_name + '_src_streams')
+        stream = None
+        counter = 10   # Sanity check to catch loops in _src_streams
+        try:
+            while srcs:
+                stream = srcs[0]
+                self._raise_if_attr_found(stream, key)
+                self._raise_if_attr_found('cbf', stream, key)
+                srcs = self._get_telstate_attr(stream + '_src_streams')
+                counter -= 1
+                if counter == 0:
+                    raise BrokenFile('Too many levels of streams in *_src_streams')
+            if stream is not None:
+                instrument = self._get_telstate_attr(stream + '_instrument_dev_name')
+                if instrument:
+                    self._raise_if_attr_found(instrument, key)
+                    self._raise_if_attr_found('cbf', instrument, key)
+            if cbf_group is not None:
+                self._raise_if_attr_found('cbf', key)
+                self._raise_if_attr_found(key, h5_group=cbf_group)
+        except _AttributeFound as exc:
+            return exc.args[0]
+        if required:
+            raise BrokenFile('File does not contain {!r}'.format(key))
+        return default
+
+    def _get_l0_attr(self, key, cbf_group=None, sdp_group=None, required=True,
+                     default=None):
+        """Retrieve attribute associated with the L0 data stream.
+
+        It is searched for in several places, using the first match from the
+        following:
+
+        - :samp:`{stream_name}_{key}` in TelescopeState
+        - :samp:`l0_{key}` in `sdp_group` in TelescopeModel, if given
+        - Places searched by :meth:`_get_cbf_attr`
+
+        Parameters
+        ----------
+        key : string
+            Base name of the attribute
+        cbf_group : :class:`h5py.Group`, optional
+            HDF5 group for the CBF in TelescopeModel
+        sdp_group : :class:`h5py.Group`, optional
+            HDF5 group for the SDP in TelescopeModel
+        required : bool, optional
+            If true (default), raise :exc:`BrokenFile` if the key is not found
+        default : object, optional
+            Value to return if the key is not found and `required` is false
+        """
+        try:
+            self._raise_if_attr_found(self.stream_name, key)
+            if sdp_group is not None:
+                self._raise_if_attr_found('l0', key, h5_group=sdp_group)
+        except _AttributeFound as exc:
+            return exc.args[0]
+        return self._get_cbf_attr(key, cbf_group, required, default)
+
     @staticmethod
-    def _get_corrprods(f, rotate_bls=False):
+    def _get_corrprods(f, stream_name, rotate_bls=False):
         """Load the correlation products list from an open file.
 
         Parameters
         ----------
         f : :class:`h5py.File`
             Open HDF5 file
+        stream_name : str
+            Name of the L0 stream, for fetching corresponding TelescopeState entries
         rotate_bls : {False, True}, optional
             Rotate baseline label list to work around early RTS correlator bug
 
@@ -576,9 +748,9 @@ class H5DataV3(DataSet):
             list of pairs of input labels
         """
         try:
-            # If sdp_l0_bls_ordering is present, it should be used in preference
+            # If <stream_name>_bls_ordering is present, it should be used in preference
             # to cbf_bls_ordering.
-            corrprods = pickle.loads(f['TelescopeState'].attrs['sdp_l0_bls_ordering'])
+            corrprods = pickle_loads(f['TelescopeState'].attrs[stream_name + '_bls_ordering'])
         except KeyError:
             # Prior to about Nov 2016, ingest would rewrite cbf_bls_ordering in
             # place.
@@ -619,8 +791,8 @@ class H5DataV3(DataSet):
 
         """
         f, version = H5DataV3._open(filename)
-        obs_params = {}
         tm_group = f['TelescopeModel']
+        stream_name = f['Data'].attrs.get('stream_name', 'sdp_l0')
         ants = []
         for name in tm_group:
             if tm_group[name].attrs.get('class') != 'AntennaPositioner':
@@ -635,15 +807,24 @@ class H5DataV3(DataSet):
             ants.append(katpoint.Antenna(ant_description))
         cam_ants = set(ant.name for ant in ants)
         # Original list of correlation products as pairs of input labels
-        corrprods = H5DataV3._get_corrprods(f)
+        corrprods = H5DataV3._get_corrprods(f, stream_name)
         # Find names of all antennas with associated correlator data
         cbf_ants = set([cp[0][:-1] for cp in corrprods] + [cp[1][:-1] for cp in corrprods])
+        # obs_params is a telstate attribute in v3.9 so try that first
+        obs_params = {}
+        if 'capture_block_id' in f.attrs:
+            attr_name = f.attrs['capture_block_id'] + '_obs_params'
+            value = f['TelescopeState'].attrs.get(attr_name)
+            if value is not None:
+                obs_params = pickle_loads(value)
+        # Fall back to old obs_params location
+        else:
+            tm_params = tm_group['obs/params']
+            for obs_param in tm_params['value']:
+                if obs_param:
+                    key, val = obs_param.split(' ', 1)
+                    obs_params[key] = np.lib.utils.safe_eval(val)
         # By default, only pick antennas that were in use by the script
-        tm_params = tm_group['obs/params']
-        for obs_param in tm_params['value']:
-            if obs_param:
-                key, val = obs_param.split(' ', 1)
-                obs_params[key] = np.lib.utils.safe_eval(val)
         obs_ants = obs_params.get('ants')
         # Otherwise fall back to the list of antennas common to CAM and CBF
         obs_ants = obs_ants.split(',') if obs_ants else list(cam_ants & cbf_ants)
