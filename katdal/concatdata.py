@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2016, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -189,7 +189,7 @@ class ConcatenatedLazyIndexer(LazyIndexer):
         dtypes = set([indexer.dtype for indexer in self.indexers])
         if len(dtypes) == 1:
             return dtypes.pop()
-        elif np.all([np.issubdtype(dtype, np.str) for dtype in dtypes]):
+        elif np.all([np.issubdtype(dtype, np.string_) for dtype in dtypes]):
             # Strings of different lengths have different dtypes (e.g. '|S1' vs '|S10') but can be safely concatenated
             return np.dtype('|S%d' % (max([dt.itemsize for dt in dtypes]),))
         else:
@@ -580,7 +580,7 @@ class ConcatenatedDataSet(DataSet):
             for n, d in enumerate(self.datasets):
                 d._set_keep(time_keep=self._time_keep[self._segments[n]:self._segments[n + 1]])
             # Ensure that sensor cache gets updated time selection
-            if self.sensor is not None:
+            if self.sensor:
                 self.sensor._set_keep(self._time_keep)
         if freq_keep is not None:
             self._freq_keep = freq_keep

@@ -1,6 +1,39 @@
 History
 =======
 
+0.10 (2018-05-17)
+-----------------
+* Rally around the MeerKAT Visibility Format (MVF)
+* First optimised converter from MVF v4 to MS: mvftoms
+* Latest v4 fixes (synthetic timestamps, autodetection, NPY files in Ceph)
+* Flag and zero missing chunks
+* Now requires katsdptelstate (released), dask, h5py 2.3 and Python 2.7
+* Restore S3 unit tests and NumPy 1.11 (on Ubuntu 16.04) support
+
+0.9.5 (2018-02-22)
+------------------
+* New HDF5 v3.9 file format in anticipation of v4 (affects obs_params)
+* Fix receiver serial numbers in recent MeerKAT data sets
+* Add dask support to ChunkStore
+* katdal.open() works on v4 RDB files
+
+0.9 (2018-01-16)
+----------------
+* New ChunkStore and telstate-based parser for future v4 format
+* Use python-casacore (>=2.2.1) to create Measurement Sets instead of blank.ms
+* Read new-style noise diode sensor names, serial numbers and L0 stream metadata
+* Select multiple polarisations (useful for cross-pol)
+* Relax the "expected number of dumps" check to avoid spurious warnings
+* Fix NumPy 1.14 warnings
+
+0.8 (2017-08-08)
+----------------
+* Fix upside-down MeerKAT images
+* SensorData rework to load gain solutions and access telstate efficiently
+* Improve mapping of sensor events onto dumps, especially for long (8 s) dumps
+* Fix NumPy 1.13 warnings and errors
+* Support UHF receivers
+
 0.7.1 (2017-01-19)
 ------------------
 
