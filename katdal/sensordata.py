@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2016, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -171,11 +171,30 @@ class RecordSensorData(SensorData):
                 len(self._data), self.dtype, id(self))
 
 
+def pickle_loads(raw, no_unpickle=()):
+    """Load a pickle that might be wrapped in np.void or np.ndarray.
+
+    The np.void wrapping is needed to pass variable-length binary strings
+    through h5py. The pickle module handles it transparently, but cPickle does
+    not.
+
+    If the value is a string and is in no_unpickle, it is returned verbatim.
+    This is for backwards compatibility with older files that didn't use
+    pickles.
+    """
+    if isinstance(raw, (np.void, np.ndarray)):
+        return pickle.loads(raw.tostring())
+    elif raw not in no_unpickle:
+        return pickle.loads(raw)
+    else:
+        return raw
+
+
 def _h5_telstate_unpack(s):
     """Unpack a telstate value from its string representation."""
     try:
         # Since 2016-05-09 the HDF5 TelescopeState contains pickled values
-        return pickle.loads(s)
+        return pickle_loads(s)
     except (pickle.UnpicklingError, ValueError, EOFError):
         try:
             # Before 2016-05-09 the telstate values were str() representations
@@ -389,15 +408,15 @@ def dummy_sensor_data(name, value=None, dtype=np.float64, timestamp=0.0):
 
     """
     if value is None:
-        if np.issubdtype(dtype, np.float):
-            value = np.nan
-        elif np.issubdtype(dtype, np.int):
-            value = -1
-        elif np.issubdtype(dtype, np.str):
+        if np.issubdtype(dtype, np.floating):
+            value = np.dtype(dtype).type(np.nan)
+        elif np.issubdtype(dtype, np.integer):
+            value = np.dtype(dtype).type(-1)
+        elif np.issubdtype(dtype, np.string_):
             # Order is important here, because np.str is a subtype of np.bool,
             # but not the other way around...
             value = ''
-        elif np.issubdtype(dtype, np.bool):
+        elif np.issubdtype(dtype, np.bool_):
             value = False
     else:
         dtype = infer_dtype([value])
@@ -558,9 +577,7 @@ class SensorCache(dict):
         self.virtual = virtual
         # Add sensor aliases
         for alias, original in aliases.iteritems():
-            for name, data in self.iteritems():
-                if name.endswith(original):
-                    self[name.replace(original, alias)] = data
+            self.add_aliases(alias, original)
 
     def __str__(self):
         """Verbose human-friendly string representation of sensor cache object."""
@@ -620,6 +637,25 @@ class SensorCache(dict):
     def iteritems(self):
         """Custom item iterator that avoids extracting sensor data."""
         return iter([(key, self.get(key, extract=False)) for key in self.iterkeys()])
+
+    def add_aliases(self, alias, original):
+        """Add alternate names / aliases for sensors.
+
+        Search for sensors with names ending in the `original` suffix and form
+        a corresponding alternate name by replacing `original` with `alias`.
+        The new aliased sensors will re-use the data of the original sensors.
+
+        Parameters
+        ----------
+        alias : string
+            The new sensor name suffix that replaces `original`
+        original : string
+            Sensors with names that end in this will get aliases
+
+        """
+        for name, data in self.iteritems():
+            if name.endswith(original):
+                self[name.replace(original, alias)] = data
 
     def get(self, name, select=False, extract=True, **kwargs):
         """Sensor values interpolated to correlator data timestamps.
@@ -702,7 +738,7 @@ class SensorCache(dict):
             # If this is the first time any sensor is accessed, obtain all data timestamps via indexer
             self.timestamps = self.timestamps[:] if not isinstance(self.timestamps, np.ndarray) else self.timestamps
             # Determine if sensor produces categorical or numerical data (by default, float data are non-categorical)
-            categ = props.get('categorical', not np.issubdtype(sensor_data.dtype, np.float))
+            categ = props.get('categorical', not np.issubdtype(sensor_data.dtype, np.floating))
             props['categorical'] = categ
             if categ:
                 sensor_data = sensor_to_categorical(sensor_data['timestamp'], sensor_data['value'],
