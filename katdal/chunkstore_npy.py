@@ -15,8 +15,10 @@
 ################################################################################
 
 """A store of chunks (i.e. N-dimensional arrays) based on NPY files."""
+from __future__ import print_function, division, absolute_import
 
 import os
+import errno
 
 import numpy as np
 
@@ -70,17 +72,21 @@ class NpyFileChunkStore(ChunkStore):
                                    dtype, shape))
         return chunk
 
+    def create_array(self, array_name):
+        """See the docstring of :meth:`ChunkStore.create_array`."""
+        # Ensure any subdirectories are in place
+        array_dir = os.path.join(self.path, array_name)
+        try:
+            os.makedirs(array_dir)
+        except OSError as e:
+            # Be happy if someone already created the path
+            if e.errno != errno.EEXIST:
+                raise
+
     def put_chunk(self, array_name, slices, chunk):
         """See the docstring of :meth:`ChunkStore.put_chunk`."""
         chunk_name, _ = self.chunk_metadata(array_name, slices, chunk=chunk)
         base_filename = os.path.join(self.path, chunk_name)
-        # Ensure any subdirectories are in place
-        try:
-            os.makedirs(os.path.dirname(base_filename))
-        except OSError as e:
-            # Be happy if someone already created the path
-            if e.errno != os.errno.EEXIST:
-                raise
         with self._standard_errors(chunk_name):
             # Rename the file when done writing to make put_chunk() atomic
             temp_filename = base_filename + '.writing.npy'
@@ -93,6 +99,33 @@ class NpyFileChunkStore(ChunkStore):
         filename = os.path.join(self.path, chunk_name) + '.npy'
         return os.path.exists(filename)
 
+    def list_chunk_ids(self, array_name):
+        """See the docstring of :meth:`ChunkStore.list_chunk_ids`."""
+        array_dir = os.path.join(self.path, array_name)
+        # Strip the .npy extension to get the chunk ID string
+        try:
+            return [fn[:-4] for fn in os.listdir(array_dir) if fn.endswith('.npy')]
+        except OSError as e:
+            # If the directory is missing, there cannot be any objects
+            if e.errno != errno.ENOENT:
+                raise
+            return []
+
+    def mark_complete(self, array_name):
+        """See the docstring of :meth:`ChunkStore.mark_complete`."""
+        self.create_array(array_name)
+        touch_file = os.path.join(self.path, array_name, 'complete')
+        with open(touch_file, 'a'):
+            os.utime(touch_file, None)
+
+    def is_complete(self, array_name):
+        """See the docstring of :meth:`ChunkStore.is_complete`."""
+        touch_file = os.path.join(self.path, array_name, 'complete')
+        return os.path.isfile(touch_file)
+
     get_chunk.__doc__ = ChunkStore.get_chunk.__doc__
     put_chunk.__doc__ = ChunkStore.put_chunk.__doc__
     has_chunk.__doc__ = ChunkStore.has_chunk.__doc__
+    list_chunk_ids.__doc__ = ChunkStore.list_chunk_ids.__doc__
+    mark_complete.__doc__ = ChunkStore.mark_complete.__doc__
+    is_complete.__doc__ = ChunkStore.is_complete.__doc__

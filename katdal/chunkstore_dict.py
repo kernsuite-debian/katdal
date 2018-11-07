@@ -15,6 +15,7 @@
 ################################################################################
 
 """A store of chunks (i.e. N-dimensional arrays) based on a dict of arrays."""
+from __future__ import print_function, division, absolute_import
 
 from .chunkstore import ChunkStore, ChunkNotFound, BadChunk
 
@@ -48,6 +49,10 @@ class DictChunkStore(ChunkStore):
                            .format(chunk_name, chunk.dtype, chunk.shape,
                                    dtype, shape))
         return chunk
+
+    def create_array(self, array_name):
+        if array_name not in self.arrays:
+            raise NotImplementedError
 
     def put_chunk(self, array_name, slices, chunk):
         """See the docstring of :meth:`ChunkStore.put_chunk`."""
