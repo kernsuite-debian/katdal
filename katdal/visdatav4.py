@@ -15,7 +15,11 @@
 ################################################################################
 
 """Data accessor class for data and metadata from various sources in v4 format."""
+from __future__ import print_function, division, absolute_import
 
+from builtins import zip
+from builtins import range
+from past.builtins import basestring
 import logging
 
 import numpy as np
@@ -28,6 +32,7 @@ from .dataset import (DataSet, BrokenFile, Subarray, SpectralWindow,
 from .sensordata import SensorCache
 from .categorical import CategoricalData
 from .lazy_indexer import DaskLazyIndexer
+from .applycal import add_applycal_sensors
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,7 @@ SENSOR_PROPS.update({
                      'initial_value': 0.0, 'transform': lambda x: x > 0.0},
     '*serial_number': {'initial_value': 0},
     '*target': {'initial_value': '', 'transform': _robust_target},
+    'obs_label': {'initial_value': '', 'allow_repeats': True},
 })
 
 SENSOR_ALIASES = {
@@ -172,7 +178,7 @@ class VisibilityDataV4(DataSet):
         # By default, only pick antennas that were in use by the script
         obs_ants = self.obs_params.get('ants')
         # Otherwise fall back to the list of antennas common to CAM and SDP / CBF
-        obs_ants = obs_ants.split(',') if obs_ants else list(cam_ants & sdp_ants)
+        obs_ants = obs_ants.split(',') if obs_ants else sorted(cam_ants & sdp_ants)
         self.ref_ant = obs_ants[0] if not ref_ant else ref_ant
 
         self.subarrays = subs = [Subarray(ants, corrprods)]
@@ -249,7 +255,7 @@ class VisibilityDataV4(DataSet):
         # (i.e. each label should introduce a new scan)
         scan.add_unmatched(label.events)
         self.sensor['Observation/scan_state'] = scan
-        self.sensor['Observation/scan_index'] = CategoricalData(range(len(scan)),
+        self.sensor['Observation/scan_index'] = CategoricalData(list(range(len(scan))),
                                                                 scan.events)
         # Move proper label events onto the nearest scan start
         # ASSUMPTION: Number of labels <= number of scans
@@ -260,7 +266,7 @@ class VisibilityDataV4(DataSet):
         if label.events[0] > 0:
             label.add(0, '')
         self.sensor['Observation/label'] = label
-        self.sensor['Observation/compscan_index'] = CategoricalData(range(len(label)),
+        self.sensor['Observation/compscan_index'] = CategoricalData(list(range(len(label))),
                                                                     label.events)
         # Use the target sensor of reference antenna to set target for each scan
         target = self.sensor.get(self.ref_ant + '_target')
@@ -284,6 +290,13 @@ class VisibilityDataV4(DataSet):
         # in data set if possible
         self._fix_flux_freq_range()
 
+        # ------ Register applycal virtual sensors ------
+
+        cal_ants = attrs.get('cal_antlist', [])
+        cal_pols = attrs.get('cal_pol_ordering', [])
+        freqs = self.spectral_windows[0].channel_freqs
+        add_applycal_sensors(self.sensor, cal_ants, cal_pols, freqs)
+
         # Apply default selection and initialise all members that depend
         # on selection in the process
         self.select(spw=0, subarray=0, ants=obs_ants)
@@ -298,9 +311,13 @@ class VisibilityDataV4(DataSet):
 
     @_flags_keep.setter
     def _flags_keep(self, names):
-        # Ensure a sequence of flag names
-        names = FLAG_NAMES if names == 'all' else \
-            names.split(',') if isinstance(names, basestring) else names
+        # Ensure `names` is a sequence of valid flag names (or an empty list)
+        if names == 'all':
+            names = FLAG_NAMES
+        elif names == '':
+            names == []
+        elif isinstance(names, basestring):
+            names = names.split(',')
         # Create boolean list for desired flags
         selection = np.zeros(8, dtype=np.uint8)
         assert len(FLAG_NAMES) == len(selection), \
@@ -343,7 +360,9 @@ class VisibilityDataV4(DataSet):
         DataSet._set_keep(self, time_keep, freq_keep, corrprod_keep, weights_keep, flags_keep)
         update_all = time_keep is not None or freq_keep is not None or corrprod_keep is not None
         update_flags = update_all or flags_keep is not None
-        if update_flags:
+        if not self.source.data:
+            self._vis = self._weights = self._flags = None
+        elif update_flags:
             # Create first-stage index from dataset selectors. Note: use
             # the member variables, not the parameters, because the parameters
             # can be None to indicate no change
@@ -390,6 +409,9 @@ class VisibilityDataV4(DataSet):
         electric field of :math:`e^{i(\omega t - jz)}` i.e. phase that
         increases with time.
         """
+        if self._vis is None:
+            raise ValueError('Visibilities are not available since dataset '
+                             'was opened with metadata only')
         return self._vis
 
     @property
@@ -407,6 +429,9 @@ class VisibilityDataV4(DataSet):
         indexing on it. Only then will data be loaded into memory.
 
         """
+        if self._weights is None:
+            raise ValueError('Weights are not available since dataset '
+                             'was opened with metadata only')
         return self._weights
 
     @property
@@ -424,6 +449,9 @@ class VisibilityDataV4(DataSet):
         indexing on it. Only then will data be loaded into memory.
 
         """
+        if self._flags is None:
+            raise ValueError('Flags are not available since dataset '
+                             'was opened with metadata only')
         return self._flags
 
     @property

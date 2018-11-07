@@ -15,7 +15,9 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.chunkstore`."""
+from __future__ import print_function, division, absolute_import
 
+from builtins import object
 import numpy as np
 from numpy.testing import assert_array_equal
 from nose.tools import (assert_raises, assert_equal, assert_true, assert_false,
@@ -77,10 +79,11 @@ class TestGenerateChunks(object):
 class TestChunkStore(object):
     """This tests the base class functionality."""
 
-    def test_put_and_get_chunk(self):
+    def test_put_get_list_chunks(self):
         store = ChunkStore()
         assert_raises(NotImplementedError, store.get_chunk, 1, 2, 3)
         assert_raises(NotImplementedError, store.put_chunk, 1, 2, 3)
+        assert_raises(NotImplementedError, store.list_chunk_ids, 1)
 
     def test_metadata_validation(self):
         store = ChunkStore()
@@ -134,6 +137,7 @@ class ChunkStoreTestBase(object):
         """Put a single chunk into store, check it, get it back and compare."""
         array_name = self.array_name(var_name)
         chunk = getattr(self, var_name)[slices]
+        self.store.create_array(array_name)
         self.store.put_chunk(array_name, slices, chunk)
         assert_true(self.store.has_chunk(array_name, slices, chunk.dtype))
         chunk_retrieved = self.store.get_chunk(array_name, slices, chunk.dtype)
@@ -153,6 +157,7 @@ class ChunkStoreTestBase(object):
     def put_dask_array(self, var_name, slices=()):
         """Put (part of) an array into store via dask."""
         array_name, dask_array, offset = self.make_dask_array(var_name, slices)
+        self.store.create_array(array_name)
         push = self.store.put_dask_array(array_name, dask_array, offset)
         results = push.compute()
         divisions_per_dim = [len(c) for c in dask_array.chunks]
@@ -169,12 +174,10 @@ class ChunkStoreTestBase(object):
                            "Error retrieving {} / {} / {}"
                            .format(array_name, offset, dask_array.chunks))
 
-    def has_dask_array(self, var_name, slices=()):
+    def has_array(self, var_name, slices=()):
         """Get (part of) an array from store via dask and compare."""
         array_name, dask_array, offset = self.make_dask_array(var_name, slices)
-        pull = self.store.has_dask_array(array_name, dask_array.chunks,
-                                         dask_array.dtype, offset)
-        results = pull.compute()
+        results = self.store.has_array(array_name, dask_array.chunks, dask_array.dtype, offset)
         divisions_per_dim = [len(c) for c in dask_array.chunks]
         assert_array_equal(results, np.full(divisions_per_dim, True))
 
@@ -212,15 +215,17 @@ class ChunkStoreTestBase(object):
         self.put_has_get_chunk('z', ())
 
     def test_put_chunk_noraise(self):
-        result = self.store.put_chunk_noraise("x", (1, 2), [])
+        name = self.array_name('x')
+        self.store.create_array(name)
+        result = self.store.put_chunk_noraise(name, (1, 2), [])
         assert_is_instance(result, BadChunk)
 
     def test_dask_array_basic(self):
         self.put_dask_array('big_y')
         self.get_dask_array('big_y')
-        self.has_dask_array('big_y')
+        self.has_array('big_y')
         self.get_dask_array('big_y', np.s_[0:3, 0:30, 0:2])
-        self.has_dask_array('big_y', np.s_[0:3, 0:30, 0:2])
+        self.has_array('big_y', np.s_[0:3, 0:30, 0:2])
 
     def test_dask_array_put_parts_get_whole(self):
         # Split big array into quarters along existing chunks and reassemble
@@ -241,3 +246,24 @@ class ChunkStoreTestBase(object):
         # Now store the last quarter and check that complete array is correct
         self.put_dask_array('big_y2', np.s_[3:8, 30:60, 0:2])
         self.get_dask_array('big_y2')
+
+    def test_list_chunk_ids(self):
+        array_name, dask_array, offset = self.make_dask_array('big_y2')
+        try:
+            chunk_ids = self.store.list_chunk_ids(array_name)
+        except NotImplementedError:
+            pass
+        else:
+            slices = da.core.slices_from_chunks(dask_array.chunks)
+            ref_chunk_ids = [self.store.chunk_id_str(s) for s in slices]
+            assert_equal(set(chunk_ids), set(ref_chunk_ids))
+
+    def test_mark_complete(self):
+        name = self.array_name('completetest')
+        try:
+            assert_false(self.store.is_complete(name))
+        except NotImplementedError:
+            pass
+        else:
+            self.store.mark_complete(name)
+            assert_true(self.store.is_complete(name))

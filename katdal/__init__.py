@@ -218,17 +218,22 @@ available at `d.catalogue`, and the original HDF5 file is still accessible via
 a back door installed at `d.file` in the case of a single-file data set.
 
 """
+from __future__ import print_function, division, absolute_import
 
+from future import standard_library
+standard_library.install_aliases()
+from past.builtins import basestring
 import logging as _logging
-import urlparse
+import urllib.parse
 
+from .datasources import open_data_source
 from .dataset import DataSet, WrongVersion
-from .lazy_indexer import LazyTransform
+from .lazy_indexer import LazyTransform, dask_getitem
 from .concatdata import ConcatenatedDataSet
 from .h5datav1 import H5DataV1
 from .h5datav2 import H5DataV2
 from .h5datav3 import H5DataV3
-from .sensordata import _sensor_completer
+from .visdatav4 import VisibilityDataV4
 
 
 # Clean up top-level namespace a bit
@@ -236,16 +241,6 @@ _dataset, _concatdata, _sensordata = dataset, concatdata, sensordata
 _h5datav1, _h5datav2, _h5datav3 = h5datav1, h5datav2, h5datav3
 _categorical, _lazy_indexer = categorical, lazy_indexer
 del dataset, concatdata, h5datav1, h5datav2, h5datav3, sensordata, categorical, lazy_indexer
-
-# Attempt to register custom IPython tab completer for sensor cache name lookups (only when run from IPython shell)
-try:
-    # IPython 0.11 and above
-    _ip = get_ipython()
-except NameError:
-    # IPython 0.10 and below (or normal Python shell)
-    _ip = __builtins__.get('__IPYTHON__')
-if hasattr(_ip, 'set_hook'):
-    _ip.set_hook('complete_command', _sensor_completer, re_key=r"(?:.*\=)?(.+?)\[")
 
 
 # Setup library logger and add a print-like handler used when no logging is configured
@@ -339,10 +334,8 @@ def open(filename, ref_ant='', time_offset=0.0, **kwargs):
     datasets = []
     for f in filenames:
         # V4 RDB file with optional URL-style query string
-        if urlparse.urlsplit(f).path.endswith('.rdb'):
-            from .datasources import open_data_source
-            from .visdatav4 import VisibilityDataV4
-            dataset = VisibilityDataV4(open_data_source(f),
+        if urllib.parse.urlsplit(f).path.endswith('.rdb'):
+            dataset = VisibilityDataV4(open_data_source(f, **kwargs),
                                        ref_ant, time_offset, **kwargs)
         else:
             dataset = _file_action('__call__', f, ref_ant, time_offset, **kwargs)

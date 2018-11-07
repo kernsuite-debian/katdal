@@ -15,6 +15,7 @@
 ################################################################################
 
 """A store of chunks (i.e. N-dimensional arrays) based on the Ceph RADOS API."""
+from __future__ import print_function, division, absolute_import
 
 import numpy as np
 try:
@@ -118,6 +119,9 @@ class RadosChunkStore(ChunkStore):
                            .format(key, dtype, shape, expected_bytes,
                                    actual_bytes))
         return np.ndarray(shape, dtype, data_str)
+
+    def create_array(self, array_name):
+        pass
 
     def put_chunk(self, array_name, slices, chunk):
         """See the docstring of :meth:`ChunkStore.put_chunk`."""

@@ -16,6 +16,8 @@
 # limitations under the License.
 ################################################################################
 
+from __future__ import print_function, division, absolute_import
+
 import os.path
 
 from setuptools import setup, find_packages
@@ -48,21 +50,22 @@ setup(name='katdal',
           'Programming Language :: Python',
           'Programming Language :: Python :: 2',
           'Programming Language :: Python :: 2.7',
+          'Programming Language :: Python :: 3',
           'Topic :: Software Development :: Libraries :: Python Modules',
           'Topic :: Scientific/Engineering :: Astronomy'],
       platforms=['OS Independent'],
       keywords='meerkat ska',
-      python_requires='~=2.7',
+      python_requires='>=2.7,!=3.0,!=3.1,!=3.2',
       setup_requires=['katversion'],
       use_katversion=True,
       install_requires=['numpy', 'katpoint', 'h5py>=2.3',
-                        'katsdptelstate[rdb]', 'dask[array]'],
+                        'katsdptelstate[rdb]', 'dask[array] >= 0.18.2', 'numba',
+                        'requests >= 2.18.0', 'defusedxml', 'future'],
       extras_require={
-          'ms': ['python-casacore >= 2.2.1', 'numba'],
-          's3': ['botocore'],
+          'ms': ['python-casacore >= 2.2.1'],
+          's3': [],
+          's3credentials': ['botocore'],
           # rados is not in PyPI but available as Debian package python-rados
-          'rados': ['rados'],
-          # katsdpauth is currently only available via GitHub
-          'auth': ['katsdpauth'],
+          'rados': ['rados']
       },
-      tests_require=['nose'])
+      tests_require=['mock', 'nose', 'subprocess32'])

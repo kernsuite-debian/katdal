@@ -15,9 +15,15 @@
 ################################################################################
 
 """Base class for accessing a visibility data set."""
+from __future__ import print_function, division, absolute_import
 
+from builtins import zip
+from past.builtins import basestring
+from builtins import object
 import time
 import logging
+import numbers
+import threading
 
 import numpy as np
 
@@ -37,21 +43,6 @@ class WrongVersion(Exception):
 
 class BrokenFile(Exception):
     """Data set could not be loaded because file is inconsistent or misses critical bits."""
-
-
-def array_equal(a1, a2):
-    """True if two arrays have the same shape and elements, False otherwise.
-
-    This is meant to be identical to :func:`numpy.array_equal` but should also
-    work for variable-sized arrays containing strings. See the discussion at
-    http://mail.scipy.org/pipermail/numpy-discussion/2007-February/025967.html.
-
-    """
-    try:
-        return np.array_equal(a1, a2)
-    except AttributeError:
-        a1, a2 = np.asarray(a1), np.asarray(a2)
-        return (a1.shape == a2.shape) and np.all(a1 == a2)
 
 
 class Subarray(object):
@@ -78,8 +69,9 @@ class Subarray(object):
     """
 
     def __init__(self, ants, corr_products):
-        self.corr_products = np.array([(inpA.lower(), inpB.lower()) for inpA, inpB in corr_products])
-        # Extract all inputs (and associated antennas) from correlation product list
+        self.corr_products = np.array([(inpA.lower(), inpB.lower())
+                                       for inpA, inpB in corr_products])
+        # Extract all inputs (and associated antennas) from corr product list
         self.inputs = sorted(set(np.ravel(self.corr_products)))
         input_ants = set([inp[:-1] for inp in self.inputs])
         # Only keep antennas that are involved in correlation products
@@ -88,12 +80,21 @@ class Subarray(object):
     def __repr__(self):
         """Short human-friendly string representation of subarray object."""
         return "<katdal.Subarray antennas=%d inputs=%d corrprods=%d at 0x%x>" % \
-               (len(self.ants), len(self.inputs), len(self.corr_products), id(self))
+               (len(self.ants), len(self.inputs), len(self.corr_products),
+                id(self))
+
+    @property
+    def _description(self):
+        """Complete string representation, used internally for comparisons."""
+        ants = '\n'.join(ant.description for ant in self.ants)
+        corrprods = ' '.join('%s,%s' % (inpA, inpB)
+                             for inpA, inpB in self.corr_products)
+        return '\n'.join((ants, corrprods))
 
     def __eq__(self, other):
         """Equality comparison operator."""
-        return isinstance(other, Subarray) and array_equal(self.corr_products, other.corr_products) and \
-            array_equal(self.inputs, other.inputs) and array_equal(self.ants, other.ants)
+        return self._description == (other._description
+                                     if isinstance(other, Subarray) else other)
 
     def __ne__(self, other):
         """Inequality comparison operator."""
@@ -101,8 +102,12 @@ class Subarray(object):
 
     def __lt__(self, other):
         """Less-than comparison operator (needed for sorting and np.unique)."""
-        return not isinstance(other, Subarray) or \
-            tuple(self.corr_products.ravel()) < tuple(other.corr_products.ravel())
+        return self._description < (other._description
+                                    if isinstance(other, Subarray) else other)
+
+    def __hash__(self):
+        """Base hash on description string, just like equality operator."""
+        return hash(self._description)
 
 
 class SpectralWindow(object):
@@ -115,6 +120,11 @@ class SpectralWindow(object):
     decreasing with channel index) or upper-sideband downconversion (frequencies
     increasing with index). For further information the receiver band and
     correlator product names are also available.
+
+    .. warning::
+
+        Instances should be treated as immutable. Changing the attributes will
+        lead to inconsistencies between them.
 
     Parameters
     ----------
@@ -130,24 +140,46 @@ class SpectralWindow(object):
         Type of downconversion (-1 => lower sideband, +1 => upper sideband)
     band : {'L', 'UHF', 'S', 'X', 'Ku'}, optional
         Name of receiver / band
+    bandwidth : float, optional
+        The bandwidth of the whole spectral window, in Hz. If specified,
+        `channel_width` is ignored and computed from the bandwidth. If not
+        specified, bandwidth is computed from the channel width. Specifying
+        this is a good idea if the channel width cannot be exactly represented
+        in floating point.
 
     Attributes
     ----------
     channel_freqs : array of float, shape (*F*,)
         Centre frequency of each frequency channel (assuming LSB mixing), in Hz
-
     """
 
     def __init__(self, centre_freq, channel_width, num_chans, product=None,
-                 sideband=-1, band='L'):
+                 sideband=-1, band='L', bandwidth=None):
+        if bandwidth is None:
+            bandwidth = channel_width * num_chans
+        else:
+            channel_width = bandwidth / num_chans
         self.centre_freq = centre_freq
         self.channel_width = channel_width
+        self.bandwidth = bandwidth
         self.num_chans = num_chans
         self.product = product if product is not None else ''
         self.sideband = sideband
         self.band = band
-        # Don't subtract half a channel width as channel 0 is centred on 0 Hz in baseband
-        self.channel_freqs = centre_freq + sideband * channel_width * (np.arange(num_chans) - num_chans / 2)
+        # channel_freqs is computed on demand
+        self._channel_freqs_lock = threading.Lock()
+        self._channel_freqs = None
+
+    @property
+    def channel_freqs(self):
+        with self._channel_freqs_lock:
+            if self._channel_freqs is None:
+                # Don't subtract half a channel width as channel 0 is centred on 0 Hz in baseband
+                # We use self.bandwidth and self.num_chans to avoid rounding
+                # errors that might accumulate if channel_width is inexact.
+                self._channel_freqs = self.centre_freq + self.sideband * self.bandwidth * (
+                    np.arange(self.num_chans) - self.num_chans // 2) / self.num_chans
+            return self._channel_freqs
 
     def __repr__(self):
         """Short human-friendly string representation of spectral window object."""
@@ -155,16 +187,24 @@ class SpectralWindow(object):
                "bandwidth=%.3f MHz channels=%d at 0x%x>" % \
                (self.band if self.band else 'unknown',
                 repr(self.product) if self.product else 'unknown',
-                self.centre_freq / 1e6, self.num_chans * self.channel_width / 1e6,
+                self.centre_freq / 1e6,
+                self.bandwidth / 1e6,
                 self.num_chans, id(self))
+
+    @property
+    def _description(self):
+        """Complete hashable representation, used internally for comparisons."""
+        # Pick values that enable a sensible ordering of spectral windows
+        # Using self.bandwidth is generally redundant but may play a role in
+        # obscure rounding cases.
+        return (self.centre_freq,
+                -self.channel_width, self.num_chans, self.sideband,
+                self.band, self.product, -self.bandwidth)
 
     def __eq__(self, other):
         """Equality comparison operator."""
-        return isinstance(other, SpectralWindow) and self.product == other.product and \
-            array_equal(self.centre_freq, other.centre_freq) and \
-            array_equal(self.channel_width, other.channel_width) and \
-            array_equal(self.num_chans, other.num_chans) and \
-            array_equal(self.channel_freqs, other.channel_freqs)
+        return self._description == (
+            other._description if isinstance(other, SpectralWindow) else other)
 
     def __ne__(self, other):
         """Inequality comparison operator."""
@@ -172,7 +212,59 @@ class SpectralWindow(object):
 
     def __lt__(self, other):
         """Less-than comparison operator (needed for sorting and np.unique)."""
-        return not isinstance(other, SpectralWindow) or tuple(self.channel_freqs) < tuple(other.channel_freqs)
+        return self._description < (
+            other._description if isinstance(other, SpectralWindow) else other)
+
+    def __hash__(self):
+        """Base hash on description tuple, just like equality operator."""
+        return hash(self._description)
+
+    def subrange(self, first, last):
+        """Get a new :class:`SpectralWindow` representing a subset of the channels.
+
+        The returned :class:`SpectralWindow` covers the same frequencies as
+        channels [first, last) of the original.
+
+        Raises
+        ------
+        IndexError
+            If [first, last) is not a (non-empty) subinterval of the channels
+        """
+        if not (0 <= first < last <= self.num_chans):
+            raise IndexError('channel indices out of range')
+        channel_shift = (first + last) // 2 - self.num_chans // 2
+        num_chans = last - first
+        # We use self.bandwidth and self.num_chans to avoid rounding errors
+        # that might accumulate if channel_width is inexact.
+        centre_freq = self.centre_freq \
+            + channel_shift * self.bandwidth * self.sideband / self.num_chans
+        return SpectralWindow(
+            centre_freq, self.channel_width, num_chans,
+            self.product, self.sideband, self.band,
+            bandwidth=self.bandwidth * num_chans / self.num_chans)
+
+    def rechannelise(self, num_chans):
+        """Get a new :class:`SpectralWindow` with a different number of channels.
+
+        The returned :class:`SpectralWindow` covers the same frequencies as the
+        original, but dividing the bandwidth into a different number of
+        channels.
+        """
+        if num_chans == self.num_chans:
+            return self
+        # Find the centre of the bandwidth (whereas centre_freq is the centre
+        # of the middle channel)
+        centre_freq = self.centre_freq
+        if self.num_chans % 2 == 0:
+            centre_freq -= self.sideband * 0.5 * self.channel_width
+        channel_width = self.bandwidth / num_chans
+        # Now convert to the centre of the new middle channel
+        if num_chans % 2 == 0:
+            centre_freq += self.sideband * 0.5 * channel_width
+        return SpectralWindow(
+            centre_freq, channel_width, num_chans,
+            self.product, self.sideband, self.band,
+            bandwidth=self.bandwidth)
 
 
 def _robust_target(description):
@@ -449,7 +541,7 @@ class DataSet(object):
         # Now add dynamic information, which depends on the current selection criteria
         descr += ['-------------------------------------------------------------------------------',
                   'Data selected according to the following criteria:']
-        for k, v in self._selection.iteritems():
+        for k, v in sorted(self._selection.items()):
             descr.append('  %s=%s' % (k, ("'%s'" % (v,)) if isinstance(v, basestring) else v))
         descr.append('-------------------------------------------------------------------------------')
         descr.append('Shape: (%d dumps, %d channels, %d correlation products) => Size: %s' %
@@ -651,7 +743,8 @@ class DataSet(object):
             or string of comma-separated names (combine all weights by default)
         flags : 'all' or string or sequence of strings, optional
             List of names of flags that will be OR'ed together, as a sequence
-            or string of comma-separated names (use all flags by default)
+            or string of comma-separated names (use all flags by default). An
+            empty string or sequence discards all flags.
 
         reset : {'auto', '', 'T', 'F', 'B', 'TF', 'TB', 'FB', 'TFB'}, optional
             Remove existing selections on specified dimensions before applying
@@ -721,7 +814,7 @@ class DataSet(object):
         # Now add the new selection criteria to the list (after the existing ones were kept or culled)
         self._selection.update(kwargs)
 
-        for k, v in self._selection.iteritems():
+        for k, v in self._selection.items():
             # Selections that affect time axis
             if k == 'dumps':
                 if np.asarray(v).dtype == np.bool:
@@ -741,7 +834,7 @@ class DataSet(object):
                 scan_sensor = self.sensor.get('Observation/scan_state' if k == 'scans' else 'Observation/label')
                 scan_index_sensor = self.sensor.get('Observation/%s_index' % (k[:-1],))
                 for scan in scans:
-                    if isinstance(scan, int):
+                    if isinstance(scan, numbers.Integral):
                         scan_keep |= (scan_index_sensor == scan)
                     elif scan[0] == '~':
                         scan_keep |= ~(scan_sensor == scan[1:])
@@ -753,7 +846,7 @@ class DataSet(object):
                 target_keep = np.zeros(len(self._time_keep), dtype=np.bool)
                 target_index_sensor = self.sensor.get('Observation/target_index')
                 for t in targets:
-                    if isinstance(t, int):
+                    if isinstance(t, numbers.Integral):
                         target_index = t
                     elif t not in self.catalogue:
                         # Warn here, in case the user gets the target subtly wrong and wonders why it is not selected
@@ -915,7 +1008,7 @@ class DataSet(object):
         """
         compscans = self.compscan_indices[:]
         # This is the active selection onto which compscan selection will be added
-        preselection = dict(self._selection.items())
+        preselection = dict(list(self._selection.items()))
         # This will ensure that the original selection is properly restored
         preselection['reset'] = 'T'
         old_timekeep = self._time_keep.copy()
