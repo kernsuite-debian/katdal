@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,29 +16,27 @@
 
 """Data accessor class for HDF5 files produced by RTS correlator."""
 from __future__ import print_function, division, absolute_import
-
 from future import standard_library
-standard_library.install_aliases()
-from builtins import zip
-from builtins import range
-from past.builtins import basestring
+standard_library.install_aliases()    # noqa: E402
+from builtins import zip, range
+
 import logging
 from collections import Counter
 
 import numpy as np
 import h5py
 import katpoint
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+import katsdptelstate
 
-from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray, SpectralWindow,
-                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS, _robust_target)
+from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray,
+                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS,
+                      _robust_target, _selection_to_list)
+from .spectral_window import SpectralWindow
 from .sensordata import (SensorCache, RecordSensorData,
-                         H5TelstateSensorData, pickle_loads, to_str)
+                         H5TelstateSensorData, telstate_decode, to_str)
 from .categorical import CategoricalData
 from .lazy_indexer import LazyIndexer, LazyTransform
+from .flags import NAMES as FLAG_NAMES, DESCRIPTIONS as FLAG_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +71,6 @@ def _calc_azel(cache, name, ant):
 VIRTUAL_SENSORS = dict(DEFAULT_VIRTUAL_SENSORS)
 VIRTUAL_SENSORS.update({'Antennas/{ant}/az': _calc_azel, 'Antennas/{ant}/el': _calc_azel})
 
-FLAG_NAMES = ('reserved0', 'static', 'cam', 'data_lost', 'ingest_rfi', 'predicted_rfi', 'cal_rfi', 'reserved7')
-FLAG_DESCRIPTIONS = ('reserved - bit 0', 'predefined static flag list', 'flag based on live CAM information',
-                     'no data was received', 'RFI detected in ingest', 'RFI predicted from space based pollutants',
-                     'RFI detected in calibration', 'reserved - bit 7')
 WEIGHT_NAMES = ('precision',)
 WEIGHT_DESCRIPTIONS = ('visibility precision (inverse variance, i.e. 1 / sigma^2)',)
 
@@ -428,6 +422,10 @@ class H5DataV3(DataSet):
         # Store antenna objects in sensor cache too, for use in virtual sensor calculations
         for ant in ants:
             self.sensor['Antennas/%s/antenna' % (ant.name,)] = CategoricalData([ant], [0, num_dumps])
+        # Extract array reference from first antenna (first 5 fields of description)
+        array_ant_fields = ['array'] + ants[0].description.split(',')[1:5]
+        array_ant = katpoint.Antenna(','.join(array_ant_fields))
+        self.sensor['Antennas/array/antenna'] = CategoricalData([array_ant], [0, num_dumps])
 
         # ------ Extract spectral windows / frequencies ------
 
@@ -436,7 +434,7 @@ class H5DataV3(DataSet):
             if 'TelescopeState' in f.file:
                 # Newer RTS, AR1 and beyond use the subarray band attribute / sensor
                 band = self._get_telstate_attr('sub_band', default='',
-                                               no_unpickle=('l', 's', 'u', 'x'))
+                                               no_decode=('l', 's', 'u', 'x'))
             else:
                 # Fallback for the original RTS before 2016-07-21 (not reliable)
                 # Find the most common valid indexer position in the subarray
@@ -596,22 +594,22 @@ class H5DataV3(DataSet):
         # Apply default selection and initialise all members that depend on selection in the process
         self.select(spw=0, subarray=0, ants=obs_ants)
 
-    def _get_telstate_attr(self, key, default=None, no_unpickle=()):
+    def _get_telstate_attr(self, key, default=None, no_decode=()):
         """Retrieve an attribute from the TelescopeState.
 
         If there is no TelescopeState group, the key is missing, or it cannot
-        be unpickled, returns `default` instead.
+        be decoded, returns `default` instead.
 
-        If the raw value is a member of `no_unpickle`, returns it directly
-        rather than attempting to unpickle it. This is to support older files
-        (created before 2016-11-30) in which the attributes were not pickled.
+        If the raw value is a member of `no_decode`, returns it directly
+        rather than attempting to decode it. This is to support older files
+        (created before 2016-11-30) in which the attributes were not encoded.
         """
         try:
-            # Note: don't apply to_str to value: if it is a binary pickle it
+            # Note: don't apply to_str to value: if it is a binary encoding it
             # needs to stay binary
             value = self.file['TelescopeState'].attrs[key]
-            return pickle_loads(value, no_unpickle)
-        except (KeyError, pickle.UnpicklingError):
+            return telstate_decode(value, no_decode)
+        except (KeyError, katsdptelstate.DecodeError):
             # In some cases the value is placed in a sensor instead. Return
             # the most recent value.
             try:
@@ -758,7 +756,7 @@ class H5DataV3(DataSet):
         try:
             # If <stream_name>_bls_ordering is present, it should be used in preference
             # to cbf_bls_ordering.
-            corrprods = pickle_loads(f['TelescopeState'].attrs[stream_name + '_bls_ordering'])
+            corrprods = telstate_decode(f['TelescopeState'].attrs[stream_name + '_bls_ordering'])
         except KeyError:
             # Prior to about Nov 2016, ingest would rewrite cbf_bls_ordering in
             # place.
@@ -824,7 +822,7 @@ class H5DataV3(DataSet):
             attr_name = to_str(f.attrs['capture_block_id']) + '_obs_params'
             value = f['TelescopeState'].attrs.get(attr_name)
             if value is not None:
-                obs_params = pickle_loads(value)
+                obs_params = telstate_decode(value)
         # Fall back to old obs_params location
         else:
             tm_params = tm_group['obs/params']
@@ -886,8 +884,7 @@ class H5DataV3(DataSet):
     def _weights_keep(self, names):
         known_weights = [row[0] for row in getattr(self, '_weights_description', [])]
         # Ensure a sequence of weight names
-        names = known_weights if names == 'all' else \
-            names.split(',') if isinstance(names, basestring) else names
+        names = _selection_to_list(names, all=known_weights)
         # Create index list for desired weights
         selection = []
         for name in names:
@@ -918,12 +915,7 @@ class H5DataV3(DataSet):
             return
         known_flags = [row[0] for row in self._flags_description]
         # Ensure `names` is a sequence of valid flag names (or an empty list)
-        if names == 'all':
-            names = known_flags
-        elif names == '':
-            names == []
-        elif isinstance(names, basestring):
-            names = names.split(',')
+        names = _selection_to_list(names, all=known_flags)
         # Create boolean list for desired flags
         selection = np.zeros(8, dtype=np.uint8)
         assert len(known_flags) == len(selection), \
@@ -1024,11 +1016,13 @@ class H5DataV3(DataSet):
         """
         if self.spectral_windows[self.spw].sideband == 1:
             # Discard the 4th / last dimension as this is subsumed in complex view
-            convert = lambda vis, keep: vis.view(np.complex64)[..., 0]
+            def convert(vis, keep):
+                return vis.view(np.complex64)[..., 0]
         else:
             # Lower side-band has the conjugate visibilities, and this isn't
             # corrected in the correlator.
-            convert = lambda vis, keep: vis.view(np.complex64)[..., 0].conjugate()
+            def convert(vis, keep):
+                return vis.view(np.complex64)[..., 0].conjugate()
         extract = LazyTransform('extract_vis',
                                 convert,
                                 lambda shape: shape[:-1], np.complex64)

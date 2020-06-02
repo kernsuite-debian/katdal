@@ -1,6 +1,44 @@
 History
 =======
 
+0.15 (2020-03-13)
+-----------------
+* Improve S3 chunk store: check tokens, improve timeouts and retries (#272 - #277)
+* Retry truncated reads and 50x errors due to S3 server overload (#274)
+* Apply flux calibration if available (#278, #279)
+* Improve mvf_rechunk and mvf_read_benchmark scripts (#280, #281, #284)
+* Fix selection by target description (#271)
+* Mark Python 2 support as deprecated (#282)
+
+0.14 (2019-10-02)
+-----------------
+* Make L2 product by applying self-calibration corrections (#253 - #256)
+* Speed up uvw calculations (#252, #262)
+* Produce documentation on readthedocs.org (#244, #245, #247, #250, #261)
+* Clean up mvftoms and fix REST_FREQUENCY in SOURCE sub-table (#258)
+* Support katstore64 API (#265)
+* Improve chunk store: detect short reads, speed up handling of lost data (#259, #260)
+* Use katpoint 0.9 and dask 1.2.1 features (#262, #243)
+
+0.13 (2019-05-09)
+-----------------
+* Load RDB files straight from archive (#233, #241)
+* Retrieve raw sensor data from CAM katstore (#234)
+* Work around one-CBF-dump offset issue (#238)
+* Improved MS output: fixed RECEPTOR_ANGLE (#230), added WEIGHT_SPECTRUM (#231)
+* Various optimisations to applycal (#224), weights (#226), S3 reads (#229)
+* Use katsdptelstate 0.8 and dask 1.1 features (#228, #233, #240)
+
+0.12 (2019-02-12)
+-----------------
+* Optionally make L1 product by applying calibration corrections (#194 - #198)
+* Let default reference antenna in v4 datasets be "array" antenna (#202, #220)
+* Use katsdptelstate v0.7: generic encodings, memory backend (#196, #201, #212)
+* Prepare for multi-dump chunks (#213, #214, #216, #217, #219)
+* Allow L1 flags to be ignored (#209, #210)
+* Deal with deprecated dask features (#204, #215)
+* Remove RADOS chunk store (it's all via S3 from here on)
+
 0.11 (2018-10-15)
 -----------------
 * Python 3 support via python-future (finally!)

@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,8 +16,8 @@
 
 """Tests for :py:mod:`katdal.chunkstore`."""
 from __future__ import print_function, division, absolute_import
-
 from builtins import object
+
 import numpy as np
 from numpy.testing import assert_array_equal
 from nose.tools import (assert_raises, assert_equal, assert_true, assert_false,
@@ -39,12 +39,9 @@ class TestGenerateChunks(object):
         # Basic check
         chunks = generate_chunks(self.shape, self.dtype, 3e6)
         assert_equal(chunks, (10 * (1,), 4 * (2048,), (144,)))
-        # Check that bad dims_to_split are ignored
-        chunks = generate_chunks(self.shape, self.dtype, 3e6, (0, 10))
-        assert_equal(chunks, (10 * (1,), (8192,), (144,)))
         # Uneven chunks in the final split
         chunks = generate_chunks(self.shape, self.dtype, 1e6)
-        assert_equal(chunks, (10 * (1,), 2 * (820,) + 8 * (819,), (144,)))
+        assert_equal(chunks, (10 * (1,), 10 * (819,) + (2,), (144,)))
 
     def test_corner_cases(self):
         # Corner case: don't select any dimensions to split -> one chunk
@@ -74,6 +71,25 @@ class TestGenerateChunks(object):
         chunks = generate_chunks(shape, self.dtype, self.nbytes / 10,
                                  dims_to_split=(1, 0), power_of_two=True)
         assert_equal(chunks, ((10,), 60 * (512,), (144,)))
+
+    def test_max_dim_elements(self):
+        chunks = generate_chunks(self.shape, self.dtype, 150000,
+                                 dims_to_split=(0, 1), power_of_two=True,
+                                 max_dim_elements={1: 50})
+        assert_equal(chunks, ((4, 4, 2), 256 * (32,), (144,)))
+        # Case where max_dim_elements forces chunks to be smaller than
+        # max_chunk_size.
+        chunks = generate_chunks(self.shape, self.dtype, 1e6,
+                                 dims_to_split=(0, 1), power_of_two=True,
+                                 max_dim_elements={0: 4, 1: 50})
+        assert_equal(chunks, ((4, 4, 2), 256 * (32,), (144,)))
+
+    def test_max_dim_elements_ignore(self):
+        """Elements not in `dims_to_split` are ignored"""
+        chunks = generate_chunks(self.shape, self.dtype, 150000,
+                                 dims_to_split=(1, 17), power_of_two=True,
+                                 max_dim_elements={0: 2, 1: 50})
+        assert_equal(chunks, ((10,), 1024 * (8,), (144,)))
 
 
 class TestChunkStore(object):
@@ -182,9 +198,10 @@ class ChunkStoreTestBase(object):
         assert_array_equal(results, np.full(divisions_per_dim, True))
 
     def test_chunk_non_existent(self):
+        array_name = self.array_name('haha')
         slices = (slice(0, 1),)
         dtype = np.dtype(np.float)
-        args = ('haha', slices, dtype)
+        args = (array_name, slices, dtype)
         shape = tuple(s.stop - s.start for s in slices)
         assert_raises(ChunkNotFound, self.store.get_chunk, *args)
         assert_false(self.store.has_chunk(*args))
@@ -258,8 +275,7 @@ class ChunkStoreTestBase(object):
             ref_chunk_ids = [self.store.chunk_id_str(s) for s in slices]
             assert_equal(set(chunk_ids), set(ref_chunk_ids))
 
-    def test_mark_complete(self):
-        name = self.array_name('completetest')
+    def _test_mark_complete(self, name):
         try:
             assert_false(self.store.is_complete(name))
         except NotImplementedError:
@@ -267,3 +283,9 @@ class ChunkStoreTestBase(object):
         else:
             self.store.mark_complete(name)
             assert_true(self.store.is_complete(name))
+
+    def test_mark_complete_array(self):
+        self._test_mark_complete(self.array_name('completetest'))
+
+    def test_mark_complete_top_level(self):
+        self._test_mark_complete('katdal-unittest-completetest')

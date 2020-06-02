@@ -1,4 +1,4 @@
-botocore==1.10.78
+botocore
 certifi
 chardet
 dask
@@ -6,18 +6,19 @@ defusedxml
 docutils
 enum34
 funcsigs
-jmespath==0.9.3
-fakeredis
+jmespath
 future
 h5py
 idna
 ipaddress
 katversion
 llvmlite
+msgpack
 netifaces
 numba
 numpy
 pyephem
+pyjwt
 python-dateutil
 python-lzf
 rdbtools
@@ -25,9 +26,9 @@ redis
 requests
 singledispatch
 six
-subprocess32==3.5.2     # katsdpdockerbase version refuses to install on Python 3
+subprocess32
 toolz
 urllib3
 
-git+ssh://git@github.com/ska-sa/katpoint#egg=katpoint
-git+ssh://git@github.com/ska-sa/katsdptelstate#egg=katsdptelstate
+katpoint @ git+https://github.com/ska-sa/katpoint
+katsdptelstate @ git+https://github.com/ska-sa/katsdptelstate

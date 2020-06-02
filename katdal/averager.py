@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,8 +15,8 @@
 ################################################################################
 
 from __future__ import print_function, division, absolute_import
-
 from builtins import range
+
 import numpy as np
 import numba
 
@@ -105,8 +105,8 @@ def average_visibilities(vis, weight, flag, timestamps, channel_freqs, timeav=10
     timestamps are second. An array of timestamps and frequencies corresponding
     to each channel is also directly averaged and returned.
 
-    Inputs
-    ------
+    Parameters
+    ----------
     vis: array(numtimestamps,numchannels,numbaselines) of complex64.
           The input visibilities to be averaged.
     weight: array(numtimestamps,numchannels,numbaselines) of float32.
@@ -125,7 +125,7 @@ def average_visibilities(vis, weight, flag, timestamps, channel_freqs, timeav=10
           Flagged averaged data in when there is a single flag in the bin if true.
           Only flag averaged data when all data in the bin is flagged if false.
 
-    Outputs
+    Returns
     -------
     av_vis: array(int(numtimestamps/timeav),int(numchannels/chanav)) of complex64.
     av_weight: array(int(numtimestamps/timeav),int(numchannels/chanav)) of float32.

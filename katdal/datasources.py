@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,26 +16,29 @@
 
 """Various sources of correlator data and metadata."""
 from __future__ import print_function, division, absolute_import
-
 from future import standard_library
-standard_library.install_aliases()
-from builtins import zip
-from builtins import object
+standard_library.install_aliases()  # noqa: 402
+from builtins import zip, object
+from future.utils import raise_from
+
 import urllib.parse
-import os
+import os.path
+import io
 import logging
-import itertools
-from collections import defaultdict, Mapping
+from collections import defaultdict
 
 import katsdptelstate
 import numpy as np
 import dask.array as da
 from dask.array.rechunk import intersect_chunks
+from dask.core import literal
 import numba
 
 from .sensordata import TelstateSensorData, TelstateToStr
 from .chunkstore_s3 import S3ChunkStore
 from .chunkstore_npy import NpyFileChunkStore
+from .chunkstore import ChunkStoreError
+from .flags import DATA_LOST
 
 
 logger = logging.getLogger(__name__)
@@ -94,13 +97,41 @@ class VisFlagsWeights(object):
 
 
 def _apply_data_lost(orig_flags, lost, block_id):
-    mark = lost.get(block_id)
+    mark = lost.data.get(block_id)
     if not mark:
         return orig_flags    # Common case - no data lost
     flags = orig_flags.copy()
     for idx in mark:
-        flags[idx] |= 8
+        flags[idx] |= DATA_LOST
     return flags
+
+
+def _narrow(array):
+    """Reduce an integer array to the narrowest type that can hold it.
+
+    It is specialised for unsigned types. It will not alter the dtype
+    if the array contains negative values.
+
+    If the type is not changed, a view is returned rather than a copy.
+    """
+    if array.dtype.kind not in ['u', 'i']:
+        raise ValueError('Array is not integral')
+    if not array.size:
+        dtype = np.uint8
+    else:
+        low = np.min(array)
+        high = np.max(array)
+        if low < 0:
+            dtype = array.dtype
+        elif high <= 0xFF:
+            dtype = np.uint8
+        elif high <= 0xFFFF:
+            dtype = np.uint16
+        elif high <= 0xFFFFFFFF:
+            dtype = np.uint32
+        else:
+            dtype = array.dtype
+    return array.astype(dtype, copy=False)
 
 
 def corrprod_to_autocorr(corrprods):
@@ -133,42 +164,36 @@ def corrprod_to_autocorr(corrprods):
             auto_indices.append(i)
     index1 = [auto_lookup[a] for (a, b) in corrprods]
     index2 = [auto_lookup[b] for (a, b) in corrprods]
-    return np.array(auto_indices), np.array(index1), np.array(index2)
+    return _narrow(np.array(auto_indices)), _narrow(np.array(index1)), _narrow(np.array(index2))
 
 
 @numba.jit(nopython=True, nogil=True)
-def weight_power_scale(block, auto_indices, index1, index2, out=None, tmp=None):
-    """Compute weight scale from visibility data.
+def weight_power_scale(vis, weights, auto_indices, index1, index2, out=None):
+    """Compute scaled weights from visibility data.
 
-    This function is designed to be usable with
-    :func:`dask.array.map_blocks`.
+    This function is designed to be usable with :func:`dask.array.blockwise`.
 
     Parameters
     ----------
-    block : np.ndarray
+    vis : np.ndarray
         Chunk of visibility data, with dimensions time, frequency, baseline
         (or any two dimensions then baseline). It must contain all the
         baselines of a stream.
+    weights : np.ndarray
+        Chunk of weight data, with the same shape as `vis`.
     auto_indices, index1, index2 : np.ndarray
-        Arrays returned by :func:`corrprod_to_autocrr`
+        Arrays returned by :func:`corrprod_to_autocorr`
     out : np.ndarray, optional
-        If specified, the output array, with same shape as `block` and dtype ``np.float32``
-    tmp : np.ndarray, optional
-        If specified, an array to use as internal scratch space (useful to
-        reuse the space across multiple calls). It must have the same shape
-        as `auto_indices` and dtype ``np.float32``.
+        If specified, the output array, with same shape as `vis` and dtype ``np.float32``
     """
-    auto_scale = np.empty(len(auto_indices), np.float32) if tmp is None else tmp
-    power_scale = np.empty(block.shape, np.float32) if out is None else out
+    auto_scale = np.empty(len(auto_indices), np.float32)
+    out = np.empty(vis.shape, np.float32) if out is None else out
     bad_weight = np.float32(2.0**-32)
-    for i in range(block.shape[0]):
-        for j in range(block.shape[1]):
+    for i in range(vis.shape[0]):
+        for j in range(vis.shape[1]):
             for k in range(len(auto_indices)):
-                # Have to force to an array here, because standard Python
-                # division raises ZeroDivisionError on divide by zero but we
-                # want to get IEEE semantics (Inf/NaN).
-                auto_scale[k] = 1 / np.array(block[i, j, auto_indices[k]].real)
-            for k in range(block.shape[2]):
+                auto_scale[k] = np.reciprocal(vis[i, j, auto_indices[k]].real)
+            for k in range(vis.shape[2]):
                 p = auto_scale[index1[k]] * auto_scale[index2[k]]
                 # If either or both of the autocorrelations has zero power then
                 # there is likely something wrong with the system. Set the
@@ -176,8 +201,8 @@ def weight_power_scale(block, auto_indices, index1, index2, out=None, tmp=None):
                 # can cause divide-by-zero problems downstream).
                 if not np.isfinite(p):
                     p = bad_weight
-                power_scale[i, j, k] = p
-    return power_scale
+                out[i, j, k] = p * weights[i, j, k]
+    return out
 
 
 class ChunkStoreVisFlagsWeights(VisFlagsWeights):
@@ -193,9 +218,15 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
         Correlation products. If given, the weights for baseline (inp1, inp2)
         will be divided by the square root of the product of the corresponding
         autocorrelations vis[inp1,inp1] and vis[inp2,inp2].
+
+    Attributes
+    ----------
+    vis_prefix : string
+        Prefix of correlator_data / visibility array, viz. its S3 bucket name
     """
     def __init__(self, store, chunk_info, corrprods):
         self.store = store
+        self.vis_prefix = chunk_info['correlator_data']['prefix']
         darray = {}
         has_arrays = []
         for array, info in chunk_info.items():
@@ -206,7 +237,6 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
             has_arrays.append((store.has_array(array_name, info['chunks'], info['dtype']),
                                info['chunks']))
         vis = darray['correlator_data']
-        base_name = chunk_info['correlator_data']['prefix']
         flags_raw_name = store.join(chunk_info['flags']['prefix'], 'flags_raw')
         # Combine original flags with data_lost indicating where values were lost from
         # other arrays.
@@ -222,8 +252,10 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
                     for piece in pieces:
                         chunk_idx, slices = zip(*piece)
                         lost[chunk_idx].append(slices)
+        # 'literal' is needed to prevent dask copying the dictionary for every
+        # chunk.
         flags = da.map_blocks(_apply_data_lost, darray['flags'], dtype=np.uint8,
-                              name=flags_raw_name, lost=lost)
+                              name=flags_raw_name, lost=literal(lost))
         # Combine low-resolution weights and high-resolution weights_channel
         weights = darray['weights'] * darray['weights_channel'][..., np.newaxis]
         # Scale weights according to power
@@ -232,12 +264,14 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
             # Ensure that we have only a single chunk on the baseline axis.
             if len(vis.chunks[2]) > 1:
                 vis = vis.rechunk({2: vis.shape[2]})
+            if len(weights.chunks[2]) > 1:
+                weights = weights.rechunk({2: weights.shape[2]})
             auto_indices, index1, index2 = corrprod_to_autocorr(corrprods)
-            power_scale = da.map_blocks(weight_power_scale, vis, dtype=np.float32,
-                                        auto_indices=auto_indices, index1=index1, index2=index2)
-            weights *= power_scale
+            weights = da.blockwise(weight_power_scale, 'ijk', vis, 'ijk', weights, 'ijk',
+                                   dtype=np.float32,
+                                   auto_indices=auto_indices, index1=index1, index2=index2)
 
-        VisFlagsWeights.__init__(self, vis, flags, weights, base_name)
+        VisFlagsWeights.__init__(self, vis, flags, weights, self.vis_prefix)
 
 
 class DataSource(object):
@@ -304,7 +338,7 @@ def view_capture_stream(telstate, capture_block_id, stream_name):
         telstate = telstate.view(stream)
     telstate = telstate.view(capture_block_id)
     for stream in streams:
-        capture_stream = telstate.SEPARATOR.join((capture_block_id, stream))
+        capture_stream = telstate.join(capture_block_id, stream)
         telstate = telstate.view(capture_stream)
     return telstate
 
@@ -332,6 +366,10 @@ def view_l0_capture_stream(telstate, capture_block_id=None, stream_name=None,
     -------
     telstate : :class:`~katdal.sensordata.TelstateToStr` object
         Telstate with a view that incorporates capture block, stream and combo
+    capture_block_id : string
+        Actual capture block ID used
+    stream_name : string
+        Actual L0 stream name used
 
     Raises
     ------
@@ -343,16 +381,16 @@ def view_l0_capture_stream(telstate, capture_block_id=None, stream_name=None,
     if not capture_block_id:
         try:
             capture_block_id = telstate['capture_block_id']
-        except KeyError:
-            raise ValueError('No capture block ID found in telstate - '
-                             'please specify it manually')
+        except KeyError as e:
+            raise_from(ValueError('No capture block ID found in telstate - '
+                                  'please specify it manually'), e)
     # Detect the captured stream
     if not stream_name:
         try:
             stream_name = telstate['stream_name']
-        except KeyError:
-            raise ValueError('No captured stream found in telstate - '
-                             'please specify the stream manually')
+        except KeyError as e:
+            raise_from(ValueError('No captured stream found in telstate - '
+                                  'please specify the stream manually'), e)
     # Build the view
     telstate = view_capture_stream(telstate, capture_block_id, stream_name)
     # Check the stream type
@@ -364,7 +402,7 @@ def view_l0_capture_stream(telstate, capture_block_id=None, stream_name=None,
                                                  expected_type))
     logger.info('Using capture block %r and stream %r',
                 capture_block_id, stream_name)
-    return telstate
+    return telstate, capture_block_id, stream_name
 
 
 def _shorten_key(telstate, key):
@@ -403,36 +441,34 @@ def _upgrade_chunk_info(chunk_info, improved_chunk_info):
     """Replace chunk info items with better ones while preserving number of dumps."""
     for key, improved_info in improved_chunk_info.items():
         original_info = chunk_info.get(key, improved_info)
-        n_original_dumps = original_info['shape'][0]
-        n_improved_dumps = improved_info['shape'][0]
-        if n_improved_dumps != n_original_dumps:
-            logger.debug("Original '%s' array has %d dumps while improved "
-                         "version has %d - forcing it to %d dumps", key,
-                         n_original_dumps, n_improved_dumps, n_original_dumps)
-            chunks = improved_info['chunks']
-            time_chunks = chunks[0]
-            # Extend/truncate improved version to match original number of dumps
-            if n_improved_dumps < n_original_dumps:
-                time_chunks += (n_original_dumps - n_improved_dumps) * (1,)
-            else:
-                for n, total in enumerate(np.cumsum((0,) + time_chunks)):
-                    if total >= n_original_dumps:
-                        time_chunks = time_chunks[:n]
-                        break
-            improved_info['chunks'] = (time_chunks,) + chunks[1:]
-            shape = improved_info['shape']
-            improved_info['shape'] = (sum(time_chunks),) + shape[1:]
-        if improved_info['shape'] != original_info['shape']:
+        if improved_info['shape'][1:] != original_info['shape'][1:]:
             raise ValueError("Original '{}' array has shape {} while improved"
-                             "version has shape {}, even after fixing dumps"
+                             "version has shape {}"
                              .format(key, original_info['shape'],
                                      improved_info['shape']))
         chunk_info[key] = improved_info
     return chunk_info
 
 
-def _infer_chunk_store(url_parts, telstate, npy_store_path=None,
-                       s3_endpoint_url=None, **kwargs):
+def _align_chunk_info(chunk_info):
+    """Inject phantom chunks to ensure all arrays have same number of dumps"""
+    max_dumps = max(info['shape'][0] for info in chunk_info.values())
+    for key, info in chunk_info.items():
+        shape = info['shape']
+        n_dumps = shape[0]
+        if n_dumps < max_dumps:
+            info['shape'] = (max_dumps,) + shape[1:]
+            # We could just add a single new chunk, but that could cause an
+            # inconveniently large chunk if there is a big difference between
+            # n_dumps and max_dumps.
+            time_chunks = info['chunks'][0] + (max_dumps - n_dumps) * (1,)
+            info['chunks'] = (time_chunks,) + info['chunks'][1:]
+            logger.debug('Adding %d phantom dumps to array %s', max_dumps - n_dumps, key)
+    return chunk_info
+
+
+def infer_chunk_store(url_parts, telstate, npy_store_path=None,
+                      s3_endpoint_url=None, array='correlator_data', **kwargs):
     """Construct chunk store automatically from dataset URL and telstate.
 
     Parameters
@@ -445,6 +481,8 @@ def _infer_chunk_store(url_parts, telstate, npy_store_path=None,
         Top-level directory of NpyFileChunkStore (overrides the default)
     s3_endpoint_url : string, optional
         Endpoint of S3 service, e.g. 'http://127.0.0.1:9000' (overrides default)
+    array : string, optional
+        Array within the bucket from which to determine the prefix
     kwargs : dict, optional
         Extra keyword arguments, typically meant for other methods and ignored
 
@@ -464,7 +502,7 @@ def _infer_chunk_store(url_parts, telstate, npy_store_path=None,
     if npy_store_path:
         return NpyFileChunkStore(npy_store_path)
     if s3_endpoint_url:
-        return S3ChunkStore.from_url(s3_endpoint_url, **kwargs)
+        return S3ChunkStore(s3_endpoint_url, **kwargs)
     # NPY chunk store is an option if the dataset is an RDB file
     if url_parts.scheme == 'file':
         # Look for adjacent data directory (presumably containing NPY files)
@@ -472,28 +510,27 @@ def _infer_chunk_store(url_parts, telstate, npy_store_path=None,
         store_path = os.path.dirname(os.path.dirname(rdb_path))
         chunk_info = telstate['chunk_info']
         chunk_info = _ensure_prefix_is_set(chunk_info, telstate)
-        vis_prefix = chunk_info['correlator_data']['prefix']
+        vis_prefix = chunk_info[array]['prefix']
         data_path = os.path.join(store_path, vis_prefix)
         if os.path.isdir(data_path):
             return NpyFileChunkStore(store_path)
-    return S3ChunkStore.from_url(telstate['s3_endpoint_url'], **kwargs)
+    return S3ChunkStore(telstate['s3_endpoint_url'], **kwargs)
 
 
-def _upgrade_flags(chunk_info, telstate):
+def _upgrade_flags(chunk_info, telstate, capture_block_id, stream_name):
     """Look for associated flag streams and override chunk_info to use them."""
     try:
         archived_streams = telstate['sdp_archived_streams']
-        capture_block_id = telstate['capture_block_id']
-        stream_name = telstate['stream_name']
     except KeyError as e:
         logger.debug('No additional flag capture streams found: %s', e)
         return chunk_info
     for s in archived_streams:
         telstate_cs = view_capture_stream(telstate, capture_block_id, s)
-        if telstate_cs['stream_type'] != 'sdp.flags' or \
+        if telstate_cs.get('stream_type') != 'sdp.flags' or \
            stream_name not in telstate_cs['src_streams']:
             continue
         # Look for chunk metadata in appropriate capture_stream telstate view
+        logger.info('Upgrading flags to use %s instead of %s', s, stream_name)
         flags_info = telstate_cs['chunk_info']
         flags_info = _ensure_prefix_is_set(flags_info, telstate_cs)
         chunk_info = _upgrade_chunk_info(chunk_info, flags_info)
@@ -515,20 +552,27 @@ class TelstateDataSource(DataSource):
     ----------
     telstate : :class:`katsdptelstate.TelescopeState` object
         Telescope state with appropriate views
+    capture_block_id : string
+        Capture block ID
+    stream_name : string
+        Name of the L0 stream
     chunk_store : :class:`katdal.ChunkStore` object, optional
         Chunk store for visibility data (the default is no data - metadata only)
     timestamps : array of float, optional
         Visibility timestamps, overriding (or fixing) the ones found in telstate
     source_name : string, optional
         Name of telstate source (used for metadata name)
+    upgrade_flags : bool, optional
+        Look for associated flag streams and use them if True (default)
 
     Raises
     ------
     KeyError
         If telstate lacks critical keys
     """
-    def __init__(self, telstate, chunk_store=None, timestamps=None,
-                 source_name='telstate'):
+    def __init__(self, telstate, capture_block_id, stream_name,
+                 chunk_store=None, timestamps=None,
+                 source_name='telstate', upgrade_flags=True):
         self.telstate = TelstateToStr(telstate)
         # Collect sensors
         sensors = {}
@@ -538,29 +582,35 @@ class TelstateDataSource(DataSource):
                 if sensor_name:
                     sensors[sensor_name] = TelstateSensorData(telstate, key)
         metadata = AttrsSensors(telstate, sensors, name=source_name)
-        if timestamps is None:
-            # Synthesise timestamps from the relevant telstate bits
-            t0 = telstate['sync_time'] + telstate['first_timestamp']
-            int_time = telstate['int_time']
+        if chunk_store is not None or timestamps is None:
             chunk_info = telstate['chunk_info']
-            n_dumps = chunk_info['correlator_data']['shape'][0]
-            timestamps = t0 + np.arange(n_dumps) * int_time
+            chunk_info = _ensure_prefix_is_set(chunk_info, telstate)
+            if upgrade_flags:
+                chunk_info = _upgrade_flags(chunk_info, telstate, capture_block_id, stream_name)
+            chunk_info = _align_chunk_info(chunk_info)
+
         if chunk_store is None:
             data = None
         else:
-            chunk_info = telstate['chunk_info']
             if telstate.get('need_weights_power_scale', False):
                 corrprods = telstate['bls_ordering']
             else:
                 corrprods = None
-            chunk_info = _ensure_prefix_is_set(chunk_info, telstate)
-            chunk_info = _upgrade_flags(chunk_info, telstate)
             data = ChunkStoreVisFlagsWeights(chunk_store, chunk_info, corrprods)
+
+        if timestamps is None:
+            # Synthesise timestamps from the relevant telstate bits
+            t0 = telstate['sync_time'] + telstate['first_timestamp']
+            int_time = telstate['int_time']
+            n_dumps = chunk_info['correlator_data']['shape'][0]
+            timestamps = t0 + np.arange(n_dumps) * int_time
         # Metadata and timestamps with or without data
         DataSource.__init__(self, metadata, timestamps, data)
+        self.capture_block_id = capture_block_id
+        self.stream_name = stream_name
 
     @classmethod
-    def from_url(cls, url, chunk_store='auto', **kwargs):
+    def from_url(cls, url, chunk_store='auto', upgrade_flags=True, **kwargs):
         """Construct TelstateDataSource from URL (RDB file / REDIS server).
 
         Parameters
@@ -570,6 +620,8 @@ class TelstateDataSource(DataSource):
         chunk_store : :class:`katdal.ChunkStore` object, optional
             Chunk store for visibility data (obtained automatically by default,
             or set to None for metadata-only dataset)
+        upgrade_flags : bool, optional
+            Look for associated flag streams and use them if True (default)
         kwargs : dict, optional
             Extra keyword arguments passed to telstate view and chunk store init
         """
@@ -586,28 +638,50 @@ class TelstateDataSource(DataSource):
             telstate = katsdptelstate.TelescopeState()
             try:
                 telstate.load_from_file(url_parts.path)
-            except OSError as err:
-                raise DataSourceNotFound(str(err))
+            except (OSError, katsdptelstate.RdbParseError) as e:
+                raise_from(DataSourceNotFound(str(e)), e)
         elif url_parts.scheme == 'redis':
             # Redis server
             try:
                 telstate = katsdptelstate.TelescopeState(url_parts.netloc, db)
             except katsdptelstate.ConnectionError as e:
-                raise DataSourceNotFound(str(e))
-        telstate = view_l0_capture_stream(telstate, **kwargs)
+                raise_from(DataSourceNotFound(str(e)), e)
+        elif url_parts.scheme in {'http', 'https'}:
+            # Treat URL prefix as an S3 object store (with auth info in kwargs)
+            store_url = urllib.parse.urljoin(url, '..')
+            # Strip off parameters, query strings and fragments to get basic URL
+            rdb_url = urllib.parse.urlunparse(
+                (url_parts.scheme, url_parts.netloc, url_parts.path, '', '', ''))
+            telstate = katsdptelstate.TelescopeState()
+            try:
+                rdb_store = S3ChunkStore(store_url, **kwargs)
+                with rdb_store.request('GET', rdb_url) as response:
+                    telstate.load_from_file(io.BytesIO(response.content))
+            except ChunkStoreError as e:
+                raise_from(DataSourceNotFound(str(e)), e)
+            # If the RDB file is opened via archive URL, use that URL and
+            # corresponding S3 credentials or token to access the chunk store
+            if chunk_store == 'auto' and not kwargs.get('s3_endpoint_url'):
+                chunk_store = rdb_store
+        else:
+            raise DataSourceNotFound("Unknown URL scheme '{}' - telstate expects "
+                                     "file, redis, or http(s)".format(url_parts.scheme))
+        telstate, capture_block_id, stream_name = view_l0_capture_stream(telstate, **kwargs)
         if chunk_store == 'auto':
-            chunk_store = _infer_chunk_store(url_parts, telstate, **kwargs)
-        return cls(telstate, chunk_store, source_name=url_parts.geturl())
+            chunk_store = infer_chunk_store(url_parts, telstate, **kwargs)
+        return cls(telstate, capture_block_id, stream_name, chunk_store,
+                   source_name=url_parts.geturl(), upgrade_flags=upgrade_flags)
 
 
 def open_data_source(url, **kwargs):
     """Construct the data source described by the given URL."""
     try:
         return TelstateDataSource.from_url(url, **kwargs)
-    except DataSourceNotFound as err:
+    except DataSourceNotFound as e:
         # Amend the error message for the case of an IP address without scheme
         url_parts = urllib.parse.urlparse(url, scheme='file')
         if url_parts.scheme == 'file' and not os.path.isfile(url_parts.path):
-            raise DataSourceNotFound(
+            raise_from(DataSourceNotFound(
                 '{} (add a URL scheme if {!r} is not meant to be a file)'
-                .format(err, url_parts.path))
+                .format(e, url_parts.path)), e)
+        raise

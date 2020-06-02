@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,23 +16,20 @@
 
 """Container that stores cached (interpolated) and uncached (raw) sensor data."""
 from __future__ import print_function, division, absolute_import
-
 from future import standard_library
-standard_library.install_aliases()
-import future.utils
-from builtins import zip
-from builtins import range
-from builtins import object
+standard_library.install_aliases()  # noqa: E402
+from future.utils import raise_from, PY3, isidentifier
+from builtins import zip, range, object
+from past.builtins import unicode
+
 import logging
-import functools
 import re
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+import threading
 
 import numpy as np
 import katpoint
+import katsdptelstate
+import requests
 
 from .categorical import (ComparableArrayWrapper, infer_dtype,
                           sensor_to_categorical)
@@ -178,7 +175,7 @@ def to_str(value):
     exception that numpy structured types with string or object fields won't
     be handled.
     """
-    if future.utils.PY3:
+    if PY3:
         if isinstance(value, np.ndarray) and value.dtype.kind == 'S':
             return np.char.decode(value, 'utf-8', 'surrogateescape')
         elif isinstance(value, bytes):
@@ -200,40 +197,33 @@ def to_str(value):
         return value
 
 
-# https://stackoverflow.com/questions/11305790
-if future.utils.PY3:
-    _pickle_loads = functools.partial(pickle.loads, encoding='latin1')
-else:
-    _pickle_loads = pickle.loads
+def telstate_decode(raw, no_decode=()):
+    """Load a katsdptelstate-encoded value that might be wrapped in np.void or
+    np.ndarray.
 
+    The np.void/np.ndarray wrapping is needed to pass variable-length binary
+    strings through h5py.
 
-def pickle_loads(raw, no_unpickle=()):
-    """Load a pickle that might be wrapped in np.void or np.ndarray.
-
-    The np.void wrapping is needed to pass variable-length binary strings
-    through h5py. The pickle module handles it transparently, but cPickle does
-    not.
-
-    If the value is a string and is in no_unpickle, it is returned verbatim.
+    If the value is a string and is in no_decode, it is returned verbatim.
     This is for backwards compatibility with older files that didn't use
-    pickles.
+    any encoding at all.
 
     The return value is also passed through :func:`to_str`.
     """
     if isinstance(raw, (np.void, np.ndarray)):
-        return to_str(_pickle_loads(raw.tostring()))
-    elif raw not in no_unpickle:
-        return to_str(_pickle_loads(raw))
+        return to_str(katsdptelstate.decode_value(raw.tostring()))
+    elif raw not in no_decode:
+        return to_str(katsdptelstate.decode_value(raw))
     else:
         return to_str(raw)
 
 
 def _h5_telstate_unpack(s):
-    """Unpack a telstate value from its string representation."""
+    """Unpack a telstate value from its encoded representation."""
     try:
-        # Since 2016-05-09 the HDF5 TelescopeState contains pickled values
-        return pickle_loads(s)
-    except (pickle.UnpicklingError, ValueError, EOFError):
+        # Since 2016-05-09 the HDF5 TelescopeState contains encoded values
+        return telstate_decode(s)
+    except katsdptelstate.DecodeError:
         try:
             # Before 2016-05-09 the telstate values were str() representations
             # This cannot be unpacked in general but works for numbers at least
@@ -248,7 +238,7 @@ class H5TelstateSensorData(RecordSensorData):
 
     This wraps the telstate sensors stored in recent HDF5 files. It differs
     in two ways from the normal HDF5 sensors: no 'status' field and values
-    stored as pickles.
+    encoded by katsdptelstate.
 
     TODO: This is a temporary fix to get at missing sensors in telstate and
     should be replaced by a proper wrapping of any telstate object.
@@ -268,7 +258,7 @@ class H5TelstateSensorData(RecordSensorData):
 
     def __init__(self, data, name=None):
         super(H5TelstateSensorData, self).__init__(data, name)
-        # The dtype is not immediately available - need to unpickle data first
+        # The dtype is not immediately available - need to decode data first
         self.dtype = None
 
     def __getitem__(self, key):
@@ -295,22 +285,18 @@ class TelstateToStr(object):
         else:
             self._telstate = telstate
 
+    @property
+    def wrapped(self):
+        return self._telstate
+
     def view(self, name, add_separator=True, exclusive=False):
         return TelstateToStr(self._telstate.view(name, add_separator, exclusive))
 
     def root(self):
         return TelstateToStr(self._telstate.root())
 
-    def keys(self, filter='*'):
-        return to_str(self._telstate.keys(filter))
-
-    @property
-    def prefixes(self):
-        return to_str(self._telstate.prefixes)
-
     def __getattr__(self, key):
-        # __getattr__ can be used for item access or to get a property of the
-        # class.
+        # __getattr__ can be used for item access or to get attributes of _telstate
         if hasattr(self._telstate.__class__, key):
             return getattr(self._telstate, key)
         else:
@@ -320,22 +306,29 @@ class TelstateToStr(object):
         # Needed because __getattr__ won't pick it up from child
         return key in self._telstate
 
+    def __dir__(self):
+        # Include public attributes of _telstate that are reachable via __getattr__
+        basic = dir(super(TelstateToStr, self))
+        extra = [d for d in dir(self._telstate)
+                 if d not in basic and not d.startswith('_')]
+        return basic + extra
+
     def __getitem__(self, key):
         return to_str(self._telstate[key])
 
     def get_message(self, channel=None):
         return to_str(self._telstate.get_message(channel))
 
-    def get(self, key, default=None, return_pickle=False):
-        value = self._telstate.get(key, default, return_pickle)
-        if not return_pickle:
+    def get(self, key, default=None, return_encoded=False):
+        value = self._telstate.get(key, default, return_encoded)
+        if not return_encoded:
             value = to_str(value)
         return value
 
     def get_range(self, key, st=None, et=None,
-                  include_previous=None, include_end=False, return_pickle=False):
-        value = self._telstate.get_range(key, st, et, include_previous, include_end, return_pickle)
-        if not return_pickle:
+                  include_previous=None, include_end=False, return_encoded=False):
+        value = self._telstate.get_range(key, st, et, include_previous, include_end, return_encoded)
+        if not return_encoded:
             value = to_str(value)
         return value
 
@@ -372,6 +365,7 @@ class TelstateSensorData(SensorData):
     """
 
     def __init__(self, telstate, name):
+        self._lock = threading.Lock()
         self._telstate = TelstateToStr(telstate)
         # This cache simplifies separate 'timestamp' / 'value' access pattern
         self._values = self._times = None
@@ -381,7 +375,7 @@ class TelstateSensorData(SensorData):
         if telstate.is_immutable(name):
             raise KeyError("No sensor named %r in telstate (it's an attribute)" %
                            (name,))
-        # The dtype is not immediately available - need to unpickle data first
+        # The dtype is not immediately available - need to decode data first
         super(TelstateSensorData, self).__init__(name, None)
 
     def __bool__(self):
@@ -389,13 +383,14 @@ class TelstateSensorData(SensorData):
         return True
 
     def _cache_data(self):
-        if not self._times:
-            value_times = self._telstate.get_range(self.name, st=0)
-            self._values = [v for v, t in value_times]
-            self.dtype = infer_dtype(self._values)
-            if self.dtype == np.object:
-                self._values = [ComparableArrayWrapper(v) for v in self._values]
-            self._times = [t for v, t in value_times]
+        with self._lock:
+            if not self._times:
+                value_times = self._telstate.get_range(self.name, st=0)
+                self._values = [v for v, t in value_times]
+                self.dtype = infer_dtype(self._values)
+                if self.dtype == np.object:
+                    self._values = [ComparableArrayWrapper(v) for v in self._values]
+                self._times = [t for v, t in value_times]
 
     def __getitem__(self, key):
         """Extract timestamp and value of each sensor data point."""
@@ -407,7 +402,6 @@ class TelstateSensorData(SensorData):
             return np.array(self._values)
         else:
             raise ValueError("Sensor %r data has no key '%s'" % (self.name, key))
-
 
 # -------------------------------------------------------------------------------------------------
 # -- Utility functions
@@ -465,6 +459,61 @@ def _safe_linear_interp(xi, yi, x):
     # Do zeroth-order interpolation beyond the range of xi
     end_weight = np.clip(end_weight, 0.0, 1.0)
     return (1.0 - end_weight) * yi[start] + end_weight * yi[end]
+
+
+def get_sensor_from_katstore(store, name, start_time, end_time):
+    """Get raw sensor data from katstore (CAM's central sensor database).
+
+    Parameters
+    ----------
+    store : string
+        Hostname / endpoint of katstore webserver speaking katstore64 API
+    name : string
+        Sensor name (the normalised / escaped version with underscores)
+    start_time, end_time : float
+        Time range for sensor records as UTC seconds since Unix epoch
+
+    Returns
+    -------
+    data : :class:`RecordSensorData` object
+        Retrieved sensor data with 'timestamp', 'value' and 'status' fields
+
+    Raises
+    ------
+    ConnectionError
+        If this cannot connect to the katstore server
+    RuntimeError
+        If connection succeeded but interaction with katstore64 API failed
+    KeyError
+        If the sensor was not found in the store or it has no data in time range
+    """
+    # The sensor name won't be in sensor store if it contains invalid characters
+    if not isidentifier(name):
+        raise KeyError("Sensor name '%s' is not valid Python identifier" % (name,))
+    with requests.Session() as session:
+        url = "http://%s/katstore/api/query" % (store,)
+        params = {'sensor': name, 'start_time': start_time, 'end_time': end_time,
+                  'limit': 1000000, 'include_value_time': 'True'}
+        try:
+            response = session.get(url, params=params)
+        except requests.exceptions.ConnectionError as exc:
+            err = ConnectionError("Could not connect to sensor store '%s'" % (store,))
+            raise_from(err, exc)
+        with response:
+            try:
+                response.raise_for_status()
+                sensor_data = response.json()['data']
+                samples = [(rec['value_time'], rec['value'], rec['status'])
+                           for rec in sensor_data if rec['sensor'] == name]
+            except (ValueError, IndexError, TypeError, KeyError,
+                    requests.exceptions.RequestException) as exc:
+                err = RuntimeError("Could not retrieve samples from '%s' (%d: %s)" %
+                                   (url, response.status_code, response.reason))
+                raise_from(err, exc)
+        if not samples:
+            raise KeyError("Sensor store has no data for sensor '%s'" % (name,))
+        samples = np.rec.fromrecords(samples, names='timestamp,value,status')
+        return RecordSensorData(samples, name)
 
 
 def dummy_sensor_data(name, value=None, dtype=np.float64, timestamp=0.0):
@@ -652,10 +701,12 @@ class SensorCache(dict):
         Alternate names for sensors, as a dictionary mapping each alias to the
         original sensor name suffix. This will create additional sensors with
         the aliased names and the data of the original sensors.
-
+    store : string, optional
+        Hostname / endpoint of katstore webserver to access additional sensors
     """
 
-    def __init__(self, cache, timestamps, dump_period, keep=slice(None), props=None, virtual={}, aliases={}):
+    def __init__(self, cache, timestamps, dump_period, keep=slice(None),
+                 props=None, virtual={}, aliases={}, store=None):
         # Initialise cache via dict constructor
         super(SensorCache, self).__init__(cache)
         self.timestamps = timestamps
@@ -667,12 +718,18 @@ class SensorCache(dict):
         # Add sensor aliases
         for alias, original in aliases.items():
             self.add_aliases(alias, original)
+        self.store = store
+        # This needs to be an RLock because instantiating a virtual sensor
+        # may require further sensor lookups (hopefully without a loop, which
+        # would really cause problems).
+        self._lock = threading.RLock()
 
     def __str__(self):
         """Verbose human-friendly string representation of sensor cache object."""
-        names = sorted([key for key in self.keys()])
-        maxlen = max([len(name) for name in names])
-        objects = [self.get(name, extract=False) for name in names]
+        with self._lock:
+            names = sorted([key for key in self.keys()])
+            maxlen = max([len(name) for name in names])
+            objects = [self.get(name, extract=False) for name in names]
         obj_reprs = [(("<numpy.ndarray shape=%s type=%s at 0x%x>" % (obj.shape, obj.dtype, id(obj)))
                      if isinstance(obj, np.ndarray) else repr(obj)) for obj in objects]
         actual = ['%s : %s' % (str(name).ljust(maxlen), obj_repr) for name, obj_repr in zip(names, obj_reprs)]
@@ -683,7 +740,8 @@ class SensorCache(dict):
 
     def __repr__(self):
         """Short human-friendly string representation of sensor cache object."""
-        sensors = [self.get(name, extract=False) for name in self.keys()]
+        with self._lock:
+            sensors = [self.get(name, extract=False) for name in self.keys()]
         return "<katdal.%s sensors=%d cached=%d virtual=%d at 0x%x>" % \
                (self.__class__.__name__, len(sensors),
                 np.sum([not isinstance(s, SensorData) for s in sensors]),
@@ -783,71 +841,86 @@ class SensorCache(dict):
         """
         if select and not extract:
             raise ValueError('Cannot apply selection on raw sensor data')
-        try:
-            # First try to load the actual sensor data from cache (remember to call base class here!)
-            sensor_data = super(SensorCache, self).__getitem__(name)
-        except KeyError:
-            # Otherwise, iterate through virtual sensor templates and look for a match
-            for pattern, create_sensor in self.virtual.items():
-                # Expand variable names enclosed in braces to the relevant regular expression
-                pattern = re.sub('({[a-zA-Z_]\w*})', lambda m: '(?P<' + m.group(0)[1:-1] + '>[^//]+)', pattern)
-                match = re.match(pattern, name)
-                if match:
-                    # Call sensor creation function with extracted variables from sensor name
-                    sensor_data = create_sensor(self, name, **match.groupdict())
-                    break
-            else:
-                raise KeyError("Unknown sensor '%s' (does not match actual name or virtual template)" % (name,))
-        # If this is the first time this sensor is accessed, extract its data and store it in cache, if enabled
-        if isinstance(sensor_data, SensorData) and extract:
-            # Look up properties associated with this specific sensor
-            self.props[name] = props = self.props.get(name, {})
-            # Look up properties associated with this class of sensor
-            for key, val in self.props.items():
-                if key[0] == '*' and name.endswith(key[1:]):
-                    props.update(val)
-            # Any properties passed directly to this method takes precedence
-            props.update(kwargs)
-            # Clean up sensor data if non-empty
-            if sensor_data:
-                # Sort sensor events in chronological order and discard duplicates and unreadable sensor values
-                sensor_data = remove_duplicates_and_invalid_values(sensor_data)
-            if not sensor_data:
-                sensor_data = dummy_sensor_data(name, value=props.get('initial_value'), dtype=sensor_data.dtype)
-                logger.warning("No usable data found for sensor '%s' - replaced with dummy data (%r)" %
-                               (name, sensor_data['value'][0]))
-            # If this is the first time any sensor is accessed, obtain all data timestamps via indexer
-            self.timestamps = self.timestamps[:] if not isinstance(self.timestamps, np.ndarray) else self.timestamps
-            # Determine if sensor produces categorical or numerical data (by default, float data are non-categorical)
-            categ = props.get('categorical', not np.issubdtype(sensor_data.dtype, np.floating))
-            props['categorical'] = categ
-            if categ:
-                sensor_data = sensor_to_categorical(sensor_data['timestamp'], sensor_data['value'],
-                                                    self.timestamps, self.dump_period, **props)
-            else:
-                # Interpolate numerical data onto data timestamps (fallback option is linear interpolation)
-                props['interp_degree'] = interp_degree = props.get('interp_degree', 1)
-                sensor_timestamps = sensor_data['timestamp']
-                # Warn if sensor data will be extrapolated to start or end of data set with potentially bogus results
-                if interp_degree > 0 and len(sensor_timestamps) > 1:
-                    if sensor_timestamps[0] > self.timestamps[0]:
-                        logger.warning(("First data point for sensor '%s' only arrives %g seconds into data set" %
-                                       (name, sensor_timestamps[0] - self.timestamps[0])) +
-                                       " - extrapolation may lead to ridiculous values")
-                    if sensor_timestamps[-1] < self.timestamps[-1]:
-                        logger.warning(("Last data point for sensor '%s' arrives %g seconds before end of data set" %
-                                       (name, self.timestamps[-1] - sensor_timestamps[-1])) +
-                                       " - extrapolation may lead to ridiculous values")
-                if PiecewisePolynomial1DFit is not None:
-                    interp = PiecewisePolynomial1DFit(max_degree=interp_degree)
-                    interp.fit(sensor_timestamps, sensor_data['value'])
-                    sensor_data = interp(self.timestamps)
+        with self._lock:
+            try:
+                # First try to load the actual sensor data from cache (remember to call base class here!)
+                sensor_data = super(SensorCache, self).__getitem__(name)
+            except KeyError:
+                # Otherwise, iterate through virtual sensor templates and look for a match
+                for pattern, create_sensor in self.virtual.items():
+                    # Expand variable names enclosed in braces to the relevant regular expression
+                    # (match anything but slashes, which are preferred delimiters in virtual sensor names)
+                    pattern = re.sub(r'(\{[a-zA-Z_]\w*\})',
+                                     lambda m: '(?P<%s>[^/]+)' % (m.group(0)[1:-1],), pattern)
+                    match = re.match(pattern, name)
+                    if match:
+                        # Call sensor creation function with extracted variables from sensor name
+                        sensor_data = create_sensor(self, name, **match.groupdict())
+                        break
                 else:
-                    if interp_degree != 1:
-                        logger.warning('Requested sensor interpolation with polynomial degree ' + str(interp_degree) +
-                                       ' but scikits.fitting not installed - falling back to linear interpolation')
-                    sensor_data = _safe_linear_interp(sensor_timestamps, sensor_data['value'], self.timestamps)
-            self[name] = sensor_data
+                    if self.store:
+                        # Katstore samples typically at least every 10 seconds
+                        start_time = self.timestamps[0] - self.dump_period - 10
+                        end_time = self.timestamps[-1] + self.dump_period + 10
+                        sensor_data = get_sensor_from_katstore(
+                            self.store, name, start_time, end_time)
+                    else:
+                        raise KeyError("Unknown sensor '%s' (does not match actual name or "
+                                       "virtual template and no sensor store provided)" % (name,))
+            # If this is the first time this sensor is accessed, extract its data and store it in cache, if enabled
+            if isinstance(sensor_data, SensorData) and extract:
+                # Look up properties associated with this specific sensor
+                self.props[name] = props = self.props.get(name, {})
+                # Look up properties associated with this class of sensor
+                for key, val in self.props.items():
+                    if key[0] == '*' and name.endswith(key[1:]):
+                        props.update(val)
+                # Any properties passed directly to this method takes precedence
+                props.update(kwargs)
+                # Clean up sensor data if non-empty
+                if sensor_data:
+                    # Sort sensor events in chronological order and discard duplicates and unreadable sensor values
+                    sensor_data = remove_duplicates_and_invalid_values(sensor_data)
+                if not sensor_data:
+                    sensor_data = dummy_sensor_data(name, value=props.get('initial_value'), dtype=sensor_data.dtype)
+                    logger.warning("No usable data found for sensor '%s' - replaced with dummy data (%r)" %
+                                   (name, sensor_data['value'][0]))
+                # If this is the first time any sensor is accessed, obtain all data timestamps via indexer
+                self.timestamps = self.timestamps[:] if not isinstance(self.timestamps, np.ndarray) else self.timestamps
+                # Determine if sensor produces categorical or numerical data
+                # (float data are non-categorical, by default)
+                categ = props.get('categorical', not np.issubdtype(sensor_data.dtype, np.floating))
+                props['categorical'] = categ
+                if categ:
+                    sensor_data = sensor_to_categorical(sensor_data['timestamp'], sensor_data['value'],
+                                                        self.timestamps, self.dump_period, **props)
+                else:
+                    # Interpolate numerical data onto data timestamps (fallback option is linear interpolation)
+                    props['interp_degree'] = interp_degree = props.get('interp_degree', 1)
+                    sensor_timestamps = sensor_data['timestamp']
+                    # Warn if sensor data will be extrapolated to start or end
+                    # of data set with potentially bogus results
+                    if interp_degree > 0 and len(sensor_timestamps) > 1:
+                        if sensor_timestamps[0] > self.timestamps[0]:
+                            logger.warning(("First data point for sensor '%s' only arrives %g seconds into data set" %
+                                           (name, sensor_timestamps[0] - self.timestamps[0])) +
+                                           " - extrapolation may lead to ridiculous values")
+                        if sensor_timestamps[-1] < self.timestamps[-1]:
+                            logger.warning(("Last data point for sensor '%s' arrives %g seconds "
+                                            "before end of data set" %
+                                           (name, self.timestamps[-1] - sensor_timestamps[-1])) +
+                                           " - extrapolation may lead to ridiculous values")
+                    if PiecewisePolynomial1DFit is not None:
+                        interp = PiecewisePolynomial1DFit(max_degree=interp_degree)
+                        interp.fit(sensor_timestamps, sensor_data['value'])
+                        sensor_data = interp(self.timestamps)
+                    else:
+                        if interp_degree != 1:
+                            logger.warning('Requested sensor interpolation with polynomial degree ' +
+                                           str(interp_degree) +
+                                           ' but scikits.fitting not installed - falling back to linear interpolation')
+                        sensor_data = _safe_linear_interp(sensor_timestamps, sensor_data['value'], self.timestamps)
+                self[name] = sensor_data
         return sensor_data[self.keep] if select else sensor_data
 
     def get_with_fallback(self, sensor_type, names):

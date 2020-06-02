@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,18 +16,16 @@
 
 """Two-stage deferred indexer for objects with expensive __getitem__ calls."""
 from __future__ import print_function, division, absolute_import
+from builtins import zip, range, object
 
-from builtins import zip
-from builtins import range
-from builtins import object
 import copy
 import threading
 from numbers import Integral
+from functools import reduce, partial
 
 import numpy as np
 import dask.array as da
 import dask.optimization
-from functools import reduce, partial
 
 # TODO support advanced integer indexing with non-strictly increasing indices (i.e. out-of-order and duplicates)
 
@@ -222,7 +220,7 @@ class LazyIndexer(object):
     The following discussion focuses on the HDF5 use case as the main example.
 
     Direct extraction of a subset of an HDF5 dataset via the __getitem__
-    interface (i.e. `dataset[index]`) has a few issues::
+    interface (i.e. `dataset[index]`) has a few issues:
 
     1. Data access can be very slow (or impossible) if a very large dataset is
        fully loaded into memory and then indexed again at a later stage
@@ -448,7 +446,7 @@ class LazyIndexer(object):
 
     @property
     def shape(self):
-        """Shape of data array after first-stage indexing and transformation, i.e. `self[:].shape`."""
+        """Shape of data array after first-stage indexing and transformation, i.e. ``self[:].shape``."""
         new_shape = reduce(lambda shape, transform: transform.new_shape(shape), self.transforms, self._initial_shape)
         # Do a quick test of shape transformation as verification of the transform chain
         allowed_shapes = [self._initial_shape[:(n + 1)] for n in range(len(self._initial_shape))]
@@ -459,7 +457,7 @@ class LazyIndexer(object):
 
     @property
     def dtype(self):
-        """Type of data array after transformation, i.e. `self[:].dtype`."""
+        """Type of data array after transformation, i.e. ``self[:].dtype``."""
         return reduce(lambda dtype, transform: transform.dtype if transform.dtype is not None else dtype,
                       self.transforms, self._initial_dtype)
 
