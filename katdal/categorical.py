@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,10 +16,8 @@
 
 """Container for categorical (i.e. non-numerical) sensor data and related tools."""
 from __future__ import print_function, division, absolute_import
+from builtins import zip, range, object
 
-from builtins import zip
-from builtins import range
-from builtins import object
 import collections
 
 import numpy as np

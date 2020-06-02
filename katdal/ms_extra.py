@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -14,52 +14,51 @@
 # limitations under the License.
 ################################################################################
 
-"""Create MS compatible data and write this data into a template MeasurementSet.
-
-This can use either casapy (the default) or pyrap to create the MS.
-
-"""
+"""Create MS compatible data and write this data into a template MeasurementSet."""
 #
 # Ludwig Schwardt
 # 25 March 2008
 #
 from __future__ import print_function, division, absolute_import
-
 from builtins import range
-import sys
+
 import os
 import os.path
 from copy import deepcopy
 
 import numpy as np
+from pkg_resources import parse_version
+import casacore
+from casacore import tables
 
-# Look for a casacore library binding that will provide Table tools
-try:
-    # Try to use the casapy table tool first
-    import casac
-    tb = casac.homefinder.find_home_by_name('tableHome').create()
-    casacore_binding = 'casapy'
-except:
-    try:
-        # Otherwise fall back to pyrap
-        from pyrap import tables
-        casacore_binding = 'pyrap'
-    except ImportError:
-        casacore_binding = ''
-    else:
-        # Perform python-casacore version checks
-        from pkg_resources import parse_version
-        import casacore
+# Perform python-casacore version checks
+pyc_ver = parse_version(casacore.__version__)
+req_ver = parse_version("2.2.1")
+if not pyc_ver >= req_ver:
+    raise ImportError("python-casacore %s is required, but the current version is %s. "
+                      "Note that python-casacore %s requires at least casacore 2.3.0."
+                      % (req_ver, pyc_ver, req_ver))
 
-        pyc_ver = parse_version(casacore.__version__)
-        req_ver = parse_version("2.2.1")
 
-        if not pyc_ver >= req_ver:
-            raise ImportError("python-casacore %s is required, "
-                              "but the current version is %s. "
-                              "Note that python-casacore %s "
-                              "requires at least casacore 2.3.0."
-                                      % (req_ver, pyc_ver, req_ver))
+def open_table(name, readonly=False, verbose=False, **kwargs):
+    """Open casacore Table."""
+    return tables.table(name, readonly=readonly, ack=verbose, **kwargs)
+
+
+def create_ms(filename, table_desc=None, dm_info=None):
+    """Create an empty MS with the default expected sub-tables and columns."""
+    with tables.default_ms(filename, table_desc, dm_info) as main_table:
+        # Add the optional SOURCE subtable
+        source_path = os.path.join(os.getcwd(), filename, 'SOURCE')
+        with tables.default_ms_subtable('SOURCE', source_path) as source_table:
+            # Add the optional REST_FREQUENCY column to appease exportuvfits
+            # (it only seems to need the column keywords)
+            rest_freq_desc = tables.makearrcoldesc(
+                'REST_FREQUENCY', 0, valuetype='DOUBLE', ndim=1,
+                keywords={'MEASINFO': {'Ref': 'LSRK', 'type': 'frequency'},
+                          'QuantumUnits': 'Hz'})
+            source_table.addcols(rest_freq_desc)
+        main_table.putkeyword('SOURCE', 'Table: ' + source_path)
 
 
 def std_scalar(comment, valueType='integer', option=0, **kwargs):
@@ -93,19 +92,21 @@ def define_hypercolumn(desc):
                                           dict(HCdatanames=[k], HCndim=v['ndim'] + 1))
                                          for k, v in desc.items() if v['dataManagerType'] == 'TiledShapeStMan'])
 
-# Map Measurement Set string types to numpy types
+
+# Map MeasurementSet string types to numpy types
 MS_TO_NP_TYPE_MAP = {
-    'INT' : np.int32,
-    'FLOAT' : np.float32,
-    'DOUBLE' : np.float64,
-    'BOOLEAN' : np.bool,
-    'COMPLEX' : np.complex64,
-    'DCOMPLEX' : np.complex128
+    'INT': np.int32,
+    'FLOAT': np.float32,
+    'DOUBLE': np.float64,
+    'BOOLEAN': np.bool,
+    'COMPLEX': np.complex64,
+    'DCOMPLEX': np.complex128
 }
+
 
 def kat_ms_desc_and_dminfo(nbl, nchan, ncorr, model_data=False):
     """
-    Creates Table Description and Data Manager Information objecs that
+    Creates Table Description and Data Manager Information objects that
     describe a MeasurementSet suitable for holding MeerKAT data.
 
     Creates additional DATA, IMAGING_WEIGHT and possibly
@@ -115,30 +116,23 @@ def kat_ms_desc_and_dminfo(nbl, nchan, ncorr, model_data=False):
 
     :param nbl: Number of baselines.
     :param nchan: Number of channels.
-    :param ncorr: Number of correlations.
+    :param ncorr: Number of correlation products.
     :param model_data: Boolean indicated whether MODEL_DATA and CORRECTED_DATA
                         should be added to the Measurement Set.
     :return: Returns a tuple containing a table description describing
             the extra columns and hypercolumns, as well as a Data Manager
             description.
     """
-
-    if not casacore_binding == 'pyrap':
-        raise ValueError("kat_ms_desc_and_dminfo requires the "
-                        "casacore binding to operate")
-
-    # Columns that will be modified.
-    # We want to keep things like their
-    # keywords, dims and shapes
-    modify_columns = { "WEIGHT", "SIGMA", "FLAG", "FLAG_CATEGORY",
-                                    "UVW", "ANTENNA1", "ANTENNA2" }
+    # Columns that will be modified. We want to keep things like their
+    # keywords, dims and shapes.
+    modify_columns = {"WEIGHT", "SIGMA", "FLAG", "FLAG_CATEGORY",
+                      "UVW", "ANTENNA1", "ANTENNA2"}
 
     # Get the required table descriptor for an MS
     table_desc = tables.required_ms_desc("MAIN")
 
     # Take columns we wish to modify
-    extra_table_desc = { c: d for c, d in table_desc.items()
-                                        if c in modify_columns }
+    extra_table_desc = {c: d for c, d in table_desc.items() if c in modify_columns}
 
     # Used to set the SPEC for each Data Manager Group
     dmgroup_spec = {}
@@ -168,102 +162,97 @@ def kat_ms_desc_and_dminfo(nbl, nchan, ncorr, model_data=False):
         while np.product(rev_shape + [2*ntilerows])*nbytes < tile_mem_limit:
             ntilerows *= 2
 
-        return { "DEFAULTTILESHAPE" : np.int32(rev_shape + [ntilerows]) }
+        return {"DEFAULTTILESHAPE": np.int32(rev_shape + [ntilerows])}
 
     # Update existing columns with shape and data manager information
     dm_group = 'UVW'
     shape = [3]
-    extra_table_desc["UVW"].update(options=0,
-        shape=shape, ndim=len(shape),
-        dataManagerGroup=dm_group,
-        dataManagerType='TiledColumnStMan')
+    extra_table_desc["UVW"].update(options=0, shape=shape, ndim=len(shape),
+                                   dataManagerGroup=dm_group,
+                                   dataManagerType='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(extra_table_desc["UVW"])
 
     dm_group = 'Weight'
     shape = [ncorr]
-    extra_table_desc["WEIGHT"].update(options=4,
-        shape=shape, ndim=len(shape),
-        dataManagerGroup=dm_group,
-        dataManagerType='TiledColumnStMan')
+    extra_table_desc["WEIGHT"].update(options=4, shape=shape, ndim=len(shape),
+                                      dataManagerGroup=dm_group,
+                                      dataManagerType='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(extra_table_desc["WEIGHT"])
 
     dm_group = 'Sigma'
     shape = [ncorr]
-    extra_table_desc["SIGMA"].update(options=4,
-        shape=shape, ndim=len(shape),
-        dataManagerGroup=dm_group,
-        dataManagerType='TiledColumnStMan')
+    extra_table_desc["SIGMA"].update(options=4, shape=shape, ndim=len(shape),
+                                     dataManagerGroup=dm_group,
+                                     dataManagerType='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(extra_table_desc["SIGMA"])
 
-
     dm_group = 'Flag'
-    shape=[nchan, ncorr]
-    extra_table_desc["FLAG"].update(options=4,
-        shape=shape, ndim=len(shape),
-        dataManagerGroup=dm_group,
-        dataManagerType='TiledColumnStMan')
+    shape = [nchan, ncorr]
+    extra_table_desc["FLAG"].update(options=4, shape=shape, ndim=len(shape),
+                                    dataManagerGroup=dm_group,
+                                    dataManagerType='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(extra_table_desc["FLAG"])
-
 
     dm_group = 'FlagCategory'
     shape = [1, nchan, ncorr]
-    extra_table_desc["FLAG_CATEGORY"].update(options=4,
-        keywords={},
-        shape=shape, ndim=len(shape),
-        dataManagerGroup=dm_group,
-        dataManagerType='TiledColumnStMan')
+    extra_table_desc["FLAG_CATEGORY"].update(options=4, keywords={},
+                                             shape=shape, ndim=len(shape),
+                                             dataManagerGroup=dm_group,
+                                             dataManagerType='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(extra_table_desc["FLAG_CATEGORY"])
-
 
     # Create new columns for integration into the MS
     additional_columns = []
 
     dm_group = 'Data'
     shape = [nchan, ncorr]
-    desc = tables.tablecreatearraycoldesc("DATA", 0+0j,
-            comment="The Visibility DATA Column",
-            options=4, valuetype='complex',
-            keywords={ "UNIT": "Jy" },
-            shape=shape, ndim=len(shape),
-            datamanagergroup=dm_group,
-            datamanagertype='TiledColumnStMan')
+    desc = tables.tablecreatearraycoldesc(
+        "DATA", 0+0j, comment="The Visibility DATA Column",
+        options=4, valuetype='complex', keywords={"UNIT": "Jy"},
+        shape=shape, ndim=len(shape), datamanagergroup=dm_group,
+        datamanagertype='TiledColumnStMan')
+    dmgroup_spec[dm_group] = dmspec(desc["desc"])
+    additional_columns.append(desc)
+
+    dm_group = 'WeightSpectrum'
+    shape = [nchan, ncorr]
+    desc = tables.tablecreatearraycoldesc(
+        "WEIGHT_SPECTRUM", 1.0, comment="Per-channel weights",
+        options=4, valuetype='float', shape=shape, ndim=len(shape),
+        datamanagergroup=dm_group, datamanagertype='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(desc["desc"])
     additional_columns.append(desc)
 
     dm_group = 'ImagingWeight'
     shape = [nchan]
-    desc = tables.tablecreatearraycoldesc("IMAGING_WEIGHT", 0,
-            comment="Weight set by imaging task (e.g. uniform weighting)",
-            options=4, valuetype='float',
-            shape=shape, ndim=len(shape),
-            datamanagergroup=dm_group,
-            datamanagertype='TiledColumnStMan')
+    desc = tables.tablecreatearraycoldesc(
+        "IMAGING_WEIGHT", 0,
+        comment="Weight set by imaging task (e.g. uniform weighting)",
+        options=4, valuetype='float', shape=shape, ndim=len(shape),
+        datamanagergroup=dm_group, datamanagertype='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(desc["desc"])
     additional_columns.append(desc)
 
     # Add MODEL_DATA and CORRECTED_DATA if requested
-    if model_data == True:
+    if model_data:
         dm_group = 'ModelData'
-        shape=[nchan, ncorr]
-        desc = tables.tablecreatearraycoldesc("MODEL_DATA", 0+0j,
-                comment="The Visibility MODEL_DATA Column",
-                options=4, valuetype='complex',
-                keywords={ "UNIT": "Jy" },
-                shape=shape, ndim=len(shape),
-                datamanagergroup=dm_group,
-                datamanagertype='TiledColumnStMan')
+        shape = [nchan, ncorr]
+        desc = tables.tablecreatearraycoldesc(
+            "MODEL_DATA", 0+0j, comment="The Visibility MODEL_DATA Column",
+            options=4, valuetype='complex', keywords={"UNIT": "Jy"},
+            shape=shape, ndim=len(shape), datamanagergroup=dm_group,
+            datamanagertype='TiledColumnStMan')
         dmgroup_spec[dm_group] = dmspec(desc["desc"])
         additional_columns.append(desc)
 
         dm_group = 'CorrectedData'
-        shape=[nchan, ncorr]
-        desc = tables.tablecreatearraycoldesc("CORRECTED_DATA", 0+0j,
-                comment="The Visibility CORRECTED_DATA Column",
-                options=4, valuetype='complex',
-                keywords={ "UNIT": "Jy" },
-                shape=shape, ndim=len(shape),
-                datamanagergroup=dm_group,
-                datamanagertype='TiledColumnStMan')
+        shape = [nchan, ncorr]
+        desc = tables.tablecreatearraycoldesc(
+            "CORRECTED_DATA", 0+0j,
+            comment="The Visibility CORRECTED_DATA Column",
+            options=4, valuetype='complex', keywords={"UNIT": "Jy"},
+            shape=shape, ndim=len(shape), datamanagergroup=dm_group,
+            datamanagertype='TiledColumnStMan')
         dmgroup_spec[dm_group] = dmspec(desc["desc"])
         additional_columns.append(desc)
 
@@ -279,6 +268,7 @@ def kat_ms_desc_and_dminfo(nbl, nchan, ncorr, model_data=False):
     dminfo = tables.makedminfo(table_desc, dmgroup_spec)
 
     return extra_table_desc, dminfo
+
 
 caltable_desc = {}
 caltable_desc['TIME'] = std_scalar('Timestamp of solution', 'double', option=5)
@@ -302,41 +292,10 @@ caltable_desc_complex = deepcopy(caltable_desc)
 caltable_desc_complex['CPARAM'] = std_array('Solution values', 'complex', -1)
 define_hypercolumn(caltable_desc_complex)
 
-# Define the appropriate way to open a table using the selected binding
-if casacore_binding == 'casapy':
-    def open_table(filename, readonly=False, ack=False, **kwargs):
-        success = tb.open(filename, nomodify=readonly, **kwargs)
-        return tb if success else None
-
-    def create_ms(filename, table_desc=None, dm_info=None):
-        raise NotImplementedError("create_ms not implemented for casapy")
-
-elif casacore_binding == 'pyrap':
-    def open_table(filename, readonly=False, ack=False, **kwargs):
-        t = tables.table(filename, readonly=readonly, ack=ack, **kwargs)
-
-        return t if type(t) == tables.table else None
-
-    def create_ms(filename, table_desc=None, dm_info=None):
-        with tables.default_ms(filename, table_desc, dm_info) as T:
-            # Add the SOURCE subtable
-            source_filename = os.path.join(os.getcwd(), filename, "SOURCE")
-            tables.default_ms_subtable("SOURCE", source_filename)
-            T.putkeyword("SOURCE", "Table: %s" % source_filename)
-
-else:
-    def open_table(filename, readonly=False):
-        raise NotImplementedError("Cannot open MS '%s', as neither "
-                                    "casapy nor pyrap were found" % (filename,))
-
-    def create_ms(filename, table_desc=None, dm_info=None):
-        raise NotImplementedError("Cannot create MS '%s', as neither "
-                                    "casapy nor pyrap were found" % (filename,))
-
 
 # -------- Routines that create MS data structures in dictionaries -----------
 
-def populate_main_dict(uvw_coordinates, vis_data, flag_data, timestamps, antenna1_index,
+def populate_main_dict(uvw_coordinates, vis_data, flag_data, weight_data, timestamps, antenna1_index,
                        antenna2_index, integrate_length, field_id=0, state_id=1,
                        scan_number=0, model_data=None, corrected_data=None):
     """Construct a dictionary containing the columns of the MAIN table.
@@ -352,6 +311,7 @@ def populate_main_dict(uvw_coordinates, vis_data, flag_data, timestamps, antenna
     vis_data : array of complex, shape (num_vis_samples, num_channels, num_pols)
         Array containing complex visibility data in Janskys
     flag_data : array of boolean, shape same as vis_data
+    weight_data : array of float, shape same as vis_data
     timestamps : array of float, shape (num_vis_samples,)
         Array of timestamps as Modified Julian Dates in seconds
         (may contain duplicate times for multiple baselines)
@@ -414,6 +374,8 @@ def populate_main_dict(uvw_coordinates, vis_data, flag_data, timestamps, antenna
     main_dict['FLAG_CATEGORY'] = flag_data.reshape((num_vis_samples, 1, num_channels, num_pols))
     # Row flag - flag all data in this row if True (boolean)
     main_dict['FLAG_ROW'] = np.zeros(num_vis_samples, dtype=np.uint8)
+    # The visibility weights
+    main_dict['WEIGHT_SPECTRUM'] = weight_data
     # Weight set by imaging task (e.g. uniform weighting) (float, 1-dim)
     # main_dict['IMAGING_WEIGHT'] = np.ones((num_vis_samples, 1), dtype=np.float32)
     # The sampling interval (double)
@@ -437,7 +399,8 @@ def populate_main_dict(uvw_coordinates, vis_data, flag_data, timestamps, antenna
     main_dict['TIME_CENTROID'] = timestamps
     # Vector with uvw coordinates (in metres) (double, 1-dim, shape=(3,))
     main_dict['UVW'] = np.asarray(uvw_coordinates)
-    # Weight for each polarisation spectrum (float, 1-dim)
+    # Weight for each polarisation spectrum (float, 1-dim). This is just
+    # just filled with 1's, because the real weights are in WEIGHT_SPECTRUM.
     main_dict['WEIGHT'] = np.ones((num_vis_samples, num_pols), dtype=np.float32)
     return main_dict
 
@@ -568,8 +531,10 @@ def populate_feed_dict(num_feeds, num_receptors_per_feed=2):
     feed_dict['POL_RESPONSE'] = np.dstack([np.eye(2, dtype=np.complex64) for n in range(num_feeds)]).transpose()
     # Position of feed relative to feed reference position (double, 1-dim, shape=(3,))
     feed_dict['POSITION'] = np.zeros((num_feeds, 3), np.float64)
-    # The reference angle for polarisation (double, 1-dim)
-    feed_dict['RECEPTOR_ANGLE'] = np.zeros((num_feeds, num_receptors_per_feed), dtype=np.float64)
+    # The reference angle for polarisation (double, 1-dim). A parallactic angle of
+    # 0 means that V is aligned to x (celestial North), but we are mapping H to x
+    # so we have to correct with a -90 degree rotation.
+    feed_dict['RECEPTOR_ANGLE'] = np.full((num_feeds, num_receptors_per_feed), -np.pi / 2, dtype=np.float64)
     # ID for this spectral window setup (integer)
     feed_dict['SPECTRAL_WINDOW_ID'] = - np.ones(num_feeds, dtype=np.int32)
     # Midpoint of time for which this set of parameters is accurate (double)
@@ -752,29 +717,54 @@ def populate_spectral_window_dict(center_frequencies, channel_bandwidths, ref_fr
     return spectral_window_dict
 
 
-def populate_source_dict(phase_centers, time_origins, center_frequencies, field_names=None):
+def populate_source_dict(phase_centers, time_origins, field_names=None):
     """Construct a dictionary containing the columns of the SOURCE subtable.
 
     The SOURCE subtable describes time-variable source information, that may
     be associated with a given FIELD_ID. It appears to be optional, but for
-    completeness it is included here (with no time varying terms).
+    completeness it is included here (with no time varying terms). Some RARG
+    tasks and CASA's exportuvfits do require it, though.
+
+    Parameters
+    ----------
+    phase_centers : array of float, shape (M, 2)
+        Direction of *M* phase centers as (ra, dec) coordinates in radians
+    time_origins : array of float, shape (M,)
+        Time origins where the *M* phase centers are correct, as Modified Julian
+        Dates in seconds
+    field_names : array of string, shape (M,), optional
+        Names of fields/pointings (typically some source names)
+
+    Returns
+    -------
+    source_dict : dict
+        Dictionary containing columns of SOURCE subtable
+
     """
-    num_channels = len(center_frequencies)
     phase_centers = np.atleast_2d(np.asarray(phase_centers, np.float64))
     num_fields = len(phase_centers)
     if field_names is None:
         field_names = ['Source%d' % (field,) for field in range(num_fields)]
     source_dict = {}
-    source_dict['SOURCE_ID'] = np.arange(num_fields,dtype=np.int32)
+    # Source identifier as specified in the FIELD sub-table (integer)
+    source_dict['SOURCE_ID'] = np.arange(num_fields, dtype=np.int32)
+    # Source proper motion in radians per second (double, 1-dim, shape=(2,))
     source_dict['PROPER_MOTION'] = np.zeros((num_fields, 2), dtype=np.float32)
+    # Source direction (e.g. RA, DEC) in radians (double, 1-dim, shape=(2,))
     source_dict['DIRECTION'] = phase_centers
-    source_dict['CALIBRATION_GROUP'] = np.ones(num_fields,dtype=np.int32) * -1 # Grouping for calibration purpose
+    # Calibration group number to which this source belongs (integer)
+    source_dict['CALIBRATION_GROUP'] = np.full(num_fields, -1, dtype=np.int32)
+    # Name of source as given during observations (string)
     source_dict['NAME'] = np.atleast_1d(field_names)
-    source_dict['NUM_LINES'] = np.ones(num_fields,dtype=np.int32) # Number of spectral lines
+    # Number of spectral line transitions associated with this source
+    # and spectral window id combination (integer)
+    source_dict['NUM_LINES'] = np.zeros(num_fields, dtype=np.int32)
+    # Midpoint of time for which this set of parameters is accurate (double)
     source_dict['TIME'] = np.atleast_1d(np.asarray(time_origins, dtype=np.float64))
-    source_dict['REST_FREQUENCY'] = np.tile(np.array([center_frequencies[num_channels // 2]],
-                                                     dtype=np.float64), (num_fields, 1))
-    source_dict['SYSVEL'] = np.ones((num_fields, 1), dtype=np.float64)
+    # Rest frequencies for the transitions in Hz (double, 1-dim, shape=(NUM_LINES,))
+    # This column is optional but expected by exportuvfits and even though
+    # NUM_LINES is 0, put something sensible here in case it is read.
+    source_dict['REST_FREQUENCY'] = np.zeros((num_fields, 0), dtype=np.float64)
     return source_dict
 
 
@@ -820,7 +810,7 @@ def populate_field_dict(phase_centers, time_origins, field_names=None):
     # Direction of REFERENCE center (e.g. RA, DEC) as polynomial in time (double, 2-dim)
     field_dict['REFERENCE_DIR'] = phase_centers
     # Source id (integer), or a value of -1 indicates there is no corresponding source defined
-    field_dict['SOURCE_ID'] = np.arange(num_fields,dtype=np.int32) # the same as source id
+    field_dict['SOURCE_ID'] = np.arange(num_fields, dtype=np.int32)  # the same as source id
     # Time origin for direction and rate (double)
     field_dict['TIME'] = np.atleast_1d(np.asarray(time_origins, dtype=np.float64))
     return field_dict
@@ -976,18 +966,10 @@ def populate_ms_dict(uvw_coordinates, vis_data, timestamps, antenna1_index, ante
     ms_dict['SPECTRAL_WINDOW'] = populate_spectral_window_dict(center_frequencies, channel_bandwidths)
     ms_dict['FIELD'] = populate_field_dict(phase_center, start_time)
     ms_dict['STATE'] = populate_state_dict(obs_modes)
-    ms_dict['SOURCE'] = populate_source_dict(phase_center)
+    ms_dict['SOURCE'] = populate_source_dict(phase_center, start_time)
     return ms_dict
 
 # ----------------- Write completed dictionary to MS file --------------------
-
-
-def open_main(ms_name, verbose=True):
-    t = open_table(ms_name, ack=verbose)
-    if t is None:
-        print("Failed to open main table for writing.")
-        sys.exit(1)
-    return t
 
 
 def write_rows(t, row_dict, verbose=True):
@@ -999,18 +981,21 @@ def write_rows(t, row_dict, verbose=True):
     if verbose:
         print("  added %d rows" % (num_rows,))
     for col_name, col_data in row_dict.items():
-        if col_name in t.colnames():
-            if col_data.dtype.kind == 'U':
-                col_data = np.char.encode(col_data, encoding='utf-8')
-            try:
-                t.putcol(col_name, col_data.T if casacore_binding == 'casapy' else col_data, startrow)
-                if verbose:
-                    print("  wrote column '%s' with shape %s" % (col_name, col_data.shape))
-            except RuntimeError as err:
-                print("  error writing column '%s' with shape %s (%s)" % (col_name, col_data.shape, err))
-        else:
+        if col_name not in t.colnames():
             if verbose:
                 print("  column '%s' not in table" % (col_name,))
+            continue
+        if col_data.dtype.kind == 'U':
+            col_data = np.char.encode(col_data, encoding='utf-8')
+        try:
+            t.putcol(col_name, col_data, startrow)
+        except RuntimeError as err:
+            print("  error writing column '%s' with shape %s (%s)" %
+                  (col_name, col_data.shape, err))
+        else:
+            if verbose:
+                print("  wrote column '%s' with shape %s" %
+                      (col_name, col_data.shape))
 
 
 def write_dict(ms_dict, ms_name, verbose=True):
@@ -1023,14 +1008,13 @@ def write_dict(ms_dict, ms_name, verbose=True):
         for row_dict in sub_dict:
             if verbose:
                 print("Table %s:" % (sub_table_name,))
-            # Open table using whichever casacore library was found
-            t = open_table(ms_name, ack=verbose) if sub_table_name == 'MAIN' else \
-                open_table(os.path.join(ms_name, sub_table_name))
-            if verbose and t is not None:
+            # Open main table or sub-table
+            if sub_table_name == 'MAIN':
+                t = open_table(ms_name, verbose=verbose)
+            else:
+                t = open_table('::'.join((ms_name, sub_table_name)))
+            if verbose:
                 print("  opened successfully")
-            if t is None:
-                print("  could not open table!")
-                break
             write_rows(t, row_dict, verbose)
             t.close()
             if verbose:

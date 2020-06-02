@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,23 +16,26 @@
 
 """Data accessor class for data and metadata from various sources in v4 format."""
 from __future__ import print_function, division, absolute_import
+from builtins import zip, range
 
-from builtins import zip
-from builtins import range
-from past.builtins import basestring
 import logging
 
 import numpy as np
 import katpoint
 import dask.array as da
 
-from .dataset import (DataSet, BrokenFile, Subarray, SpectralWindow,
-                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS,
-                      _robust_target)
+from .dataset import (DataSet, BrokenFile, Subarray, DEFAULT_SENSOR_PROPS,
+                      DEFAULT_VIRTUAL_SENSORS, _robust_target,
+                      _selection_to_list)
+from .datasources import VisFlagsWeights
+from .spectral_window import SpectralWindow
 from .sensordata import SensorCache
 from .categorical import CategoricalData
 from .lazy_indexer import DaskLazyIndexer
-from .applycal import add_applycal_sensors
+from .applycal import (add_applycal_sensors, calc_correction,
+                       apply_vis_correction, apply_weights_correction,
+                       apply_flags_correction, CAL_PRODUCT_TYPES, INVALID_GAIN)
+from .flags import NAMES as FLAG_NAMES, DESCRIPTIONS as FLAG_DESCRIPTIONS
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,9 @@ SENSOR_PROPS.update({
     '*serial_number': {'initial_value': 0},
     '*target': {'initial_value': '', 'transform': _robust_target},
     'obs_label': {'initial_value': '', 'allow_repeats': True},
+    '*_product_G': {'initial_value': INVALID_GAIN},
+    '*_product_GPHASE': {'initial_value': INVALID_GAIN},
+    '*_product_GAMP_PHASE': {'initial_value': INVALID_GAIN},
 })
 
 SENSOR_ALIASES = {
@@ -67,20 +73,54 @@ def _calc_azel(cache, name, ant):
     return sensor_data
 
 
+def _add_sensor_alias(cache, new_name, old_name):
+    """Add an optional alias for single sensor in sensor cache."""
+    try:
+        cache[new_name] = cache.get(old_name, extract=False)
+    except KeyError:
+        pass
+
+
+def _relative_view(telstate, name):
+    """Create a telstate view by appending `name` to all existing namespaces."""
+    prefix = telstate.prefixes[-1]
+    view = telstate.view(prefix + name, exclusive=True)
+    for prefix in reversed(telstate.prefixes[:-1]):
+        view = view.view(prefix + name)
+    return view
+
+
+def _normalise_cal_products(products, cal_streams):
+    """Expand user-supplied list of cal products into fully qualified versions."""
+    requested_cal_products = _selection_to_list(products, all=cal_streams,
+                                                default=DEFAULT_CAL_PRODUCTS)
+    skip_missing_products = products in ('all', 'default') or any(
+        '.' not in product for product in requested_cal_products)
+    normalised_cal_products = []
+    for product in requested_cal_products:
+        if '.' in product:
+            normalised_cal_products.append(product)
+        elif product in cal_streams:
+            normalised_cal_products.extend(['.'.join((product, product_type))
+                                            for product_type in CAL_PRODUCT_TYPES])
+        elif product in CAL_PRODUCT_TYPES:
+            normalised_cal_products.extend(['.'.join((stream, product))
+                                            for stream in cal_streams])
+        else:
+            streams = ','.join(cal_streams)
+            streams = ' (one of {})'.format(streams) if streams else ' (none found)'
+            msg = ("Unknown calibration product '{}': it should be a stream{}, "
+                   "product type (one of {}) or <stream>.<product_type>"
+                   .format(product, streams, ','.join(CAL_PRODUCT_TYPES)))
+            raise ValueError(msg)
+    return normalised_cal_products, skip_missing_products
+
+
 VIRTUAL_SENSORS = dict(DEFAULT_VIRTUAL_SENSORS)
 VIRTUAL_SENSORS.update({'Antennas/{ant}/az': _calc_azel,
                         'Antennas/{ant}/el': _calc_azel})
 
-FLAG_NAMES = ('reserved0', 'static', 'cam', 'data_lost',
-              'ingest_rfi', 'predicted_rfi', 'cal_rfi', 'reserved7')
-FLAG_DESCRIPTIONS = ('reserved - bit 0',
-                     'predefined static flag list',
-                     'flag based on live CAM information',
-                     'no data was received',
-                     'RFI detected in ingest',
-                     'RFI predicted from space based pollutants',
-                     'RFI detected in calibration',
-                     'reserved - bit 7')
+DEFAULT_CAL_PRODUCTS = ('l1.K', 'l1.B', 'l1.G', 'l2.GPHASE')
 
 # -----------------------------------------------------------------------------
 # -- CLASS :  VisibilityDataV4
@@ -97,29 +137,70 @@ class VisibilityDataV4(DataSet):
     source : :class:`DataSource` object
         Correlator data (visibilities, flags and weights) and metadata
     ref_ant : string, optional
-        Name of reference antenna, used to partition data set into scans
-        (default is first antenna in use)
+        Name of reference antenna, used to partition data set into scans,
+        to determine the targets and as antenna for the data set catalogue
+        (no relation to the *calibration* reference antenna...). The default
+        is to use the observation activity sensor for scan partitioning,
+        the CBF target and the array reference position as catalogue antenna.
     time_offset : float, optional
         Offset to add to all correlator timestamps, in seconds
+    applycal : string or sequence of strings, optional
+        List of names of calibration products to apply to vis/weights/flags,
+        as a sequence or string of comma-separated names. An empty string or
+        sequence means no calibration will be applied (the default for now),
+        while the keyword 'all' means all available products will be applied.
+        *NB* In future the default will probably change to 'all'.
+        *NB* This is still very much an experimental feature...
+    gaincal_flux : dict mapping string to float, optional
+        Flux density (in Jy) per gaincal target name, used to flux calibrate
+        the "G" product, overriding the measured flux produced by cal pipeline
+        (if available). A value of None disables flux calibration.
+    sensor_store : string, optional
+        Hostname / endpoint of katstore webserver to access additional sensors
     kwargs : dict, optional
         Extra keyword arguments, typically meant for other formats and ignored
 
     """
-    def __init__(self, source, ref_ant='', time_offset=0.0, **kwargs):
+    def __init__(self, source, ref_ant='', time_offset=0.0, applycal='',
+                 gaincal_flux={}, sensor_store=None, **kwargs):
         DataSet.__init__(self, source.name, ref_ant, time_offset)
         attrs = source.metadata.attrs
 
         # ------ Extract timestamps ------
 
+        def _before(date):
+            return source.timestamps[0] < katpoint.Timestamp(date).secs
+
         self.source = source
         self.file = {}
         self.version = '4.0'
         self.dump_period = attrs['int_time']
+        # The CBF dump period is not in the lite RDB version
+        self.cbf_dump_period = attrs.get(
+            'i0_baseline_correlation_products_int_time', None)
         num_dumps = len(source.timestamps)
         source.timestamps += self.time_offset
-        if source.timestamps[0] < 1e9:
+        if _before('2000-01-01'):
             logger.warning("Data set has invalid first correlator timestamp "
                            "(%f)", source.timestamps[0])
+        # Workaround for one-CBF-dump offset (SR-1625), reflecting these updates:
+        # - CMC2 aka cbf_dev_N 4k fixed since at least 2019-02-11
+        # - CMC2 aka cbf_dev_N 1k fixed since at least 2019-03-03
+        # - CMC1 aka cbf_N fixed since 2019-03-15
+        cmc2 = 'cbf_dev' in attrs['sub_pool_resources']
+        cbf4k = 'c856M4k' in attrs['sub_product']
+        if (_before('2019-02-11')
+            or _before('2019-03-03') and not (cmc2 and cbf4k)
+                or _before('2019-03-15') and not cmc2):
+            if self.cbf_dump_period is not None:
+                source.timestamps -= self.cbf_dump_period
+                # Record workaround in time_offset to make it easy to verify
+                self.time_offset -= self.cbf_dump_period
+                logger.info('Corrected data timestamps backwards by 1 CBF dump '
+                            '(see JIRA ticket SR-1625 for more info)')
+            else:
+                logger.warning('Could not correct timestamps as CBF int time is unknown:'
+                               ' consider using full RDB or explicit time_offset')
         half_dump = 0.5 * self.dump_period
         self.start_time = katpoint.Timestamp(source.timestamps[0] - half_dump)
         self.end_time = katpoint.Timestamp(source.timestamps[-1] + half_dump)
@@ -129,7 +210,8 @@ class VisibilityDataV4(DataSet):
         # Assemble sensor cache
         self.sensor = SensorCache(source.metadata.sensors, source.timestamps,
                                   self.dump_period, self._time_keep,
-                                  SENSOR_PROPS, VIRTUAL_SENSORS, SENSOR_ALIASES)
+                                  SENSOR_PROPS, VIRTUAL_SENSORS, SENSOR_ALIASES,
+                                  sensor_store)
 
         # ------ Extract flags ------
 
@@ -179,15 +261,30 @@ class VisibilityDataV4(DataSet):
         obs_ants = self.obs_params.get('ants')
         # Otherwise fall back to the list of antennas common to CAM and SDP / CBF
         obs_ants = obs_ants.split(',') if obs_ants else sorted(cam_ants & sdp_ants)
-        self.ref_ant = obs_ants[0] if not ref_ant else ref_ant
+        self.ref_ant = 'array' if not ref_ant else ref_ant
+        valid_ref_ants = cam_ants | {'array'}
+        if self.ref_ant not in valid_ref_ants:
+            raise KeyError("Unknown ref_ant '%s', should be one of %s"
+                           % (self.ref_ant, valid_ref_ants))
 
         self.subarrays = subs = [Subarray(ants, corrprods)]
         self.sensor['Observation/subarray'] = CategoricalData(subs, all_dumps)
         self.sensor['Observation/subarray_index'] = CategoricalData([0], all_dumps)
-        # Store antenna objects in sensor cache too, for use in virtual sensors
+        # Store antenna objects in sensor cache too, for use in virtual
+        # sensors, and make aliases for old-style target + activity sensors
         for ant in ants:
-            sensor_name = 'Antennas/%s/antenna' % (ant.name,)
-            self.sensor[sensor_name] = CategoricalData([ant], all_dumps)
+            prefix = 'Antennas/%s/' % (ant.name,)
+            self.sensor[prefix + 'antenna'] = CategoricalData([ant], all_dumps)
+            _add_sensor_alias(self.sensor, prefix + 'activity', ant.name + '_activity')
+            _add_sensor_alias(self.sensor, prefix + 'target', ant.name + '_target')
+        # Extract array reference from first antenna (first 5 fields of description)
+        array_ant_fields = ['array'] + ants[0].description.split(',')[1:5]
+        array_ant = katpoint.Antenna(','.join(array_ant_fields))
+        # Cobble together "array" antenna sensors from various sources
+        self.sensor['Antennas/array/antenna'] = CategoricalData(
+            [array_ant], all_dumps)
+        _add_sensor_alias(self.sensor, 'Antennas/array/activity', 'obs_activity')
+        _add_sensor_alias(self.sensor, 'Antennas/array/target', 'cbf_target')
 
         # ------ Extract spectral windows / frequencies ------
 
@@ -217,7 +314,7 @@ class VisibilityDataV4(DataSet):
             centre_freq = 0.0
         product = attrs.get('sub_product', '')
         sideband = 1
-        band_map = dict(l='L', s='S', u='UHF', x='X')
+        band_map = dict(l='L', s='S', u='UHF', x='X')   # noqa: E741
         spw_params = (centre_freq, channel_width, num_chans, product, sideband,
                       band_map[band])
         # We only expect a single spectral window within a single v4 data set
@@ -227,9 +324,8 @@ class VisibilityDataV4(DataSet):
 
         # ------ Extract scans / compound scans / targets ------
 
-        # Use the activity sensor of reference antenna to partition the data
-        # set into scans (and to set their states)
-        scan = self.sensor.get(self.ref_ant + '_activity')
+        # Use activity sensor of reference antenna to partition the data set into scans
+        scan = self.sensor.get('Antennas/%s/activity' % (self.ref_ant,))
         # If the antenna starts slewing on the second dump, incorporate the
         # first dump into the slew too. This scenario typically occurs when the
         # first target is only set after the first dump is received.
@@ -268,38 +364,114 @@ class VisibilityDataV4(DataSet):
         self.sensor['Observation/label'] = label
         self.sensor['Observation/compscan_index'] = CategoricalData(list(range(len(label))),
                                                                     label.events)
-        # Use the target sensor of reference antenna to set target for each scan
-        target = self.sensor.get(self.ref_ant + '_target')
-        # Remove initial blank target (typically because antenna starts stopped)
-        if len(target) > 1 and target[0] == 'Nothing, special':
-            target.events, target.indices = target.events[1:], target.indices[1:]
-            target.events[0] = 0
+        # Use target sensor of reference antenna to set the target for each scan
+        target = self.sensor.get('Antennas/%s/target' % (self.ref_ant,))
         # Move target events onto the nearest scan start
         # ASSUMPTION: Number of targets <= number of scans
         # (i.e. only a single target allowed per scan)
         target.align(scan.events)
+        # Remove repeats introduced by scan alignment (e.g. when sequence of
+        # targets [A, B, A] becomes [A, A] if B and second A are in same scan)
+        target.remove_repeats()
+        # Remove initial target if antennas start in mode STOP
+        # (typically left over from previous capture block)
+        for segment, scan_state in scan.segments():
+            # Keep going until first non-STOP scan or a new target is set
+            if scan_state == 'stop' and target[segment.start] is target[0]:
+                continue
+            # Only remove initial target event if we move to a different target
+            if target[segment.start] is not target[0]:
+                # Only lose 1 event because target sensor doesn't allow repeats
+                target.events = target.events[1:]
+                target.indices = target.indices[1:]
+                target.events[0] = 0
+                # Remove initial target from target.unique_values if not used
+                target.align(target.events)
+            break
         self.sensor['Observation/target'] = target
         self.sensor['Observation/target_index'] = CategoricalData(target.indices,
                                                                   target.events)
-        # Set up catalogue containing all targets in file, with reference
-        # antenna as default antenna
+        # Set up catalogue containing all targets in file, with reference antenna as default antenna
         self.catalogue.add(target.unique_values)
-        ref_sensor = 'Antennas/%s/antenna' % (self.ref_ant,)
-        self.catalogue.antenna = self.sensor.get(ref_sensor)[0]
+        self.catalogue.antenna = self.sensor['Antennas/%s/antenna' % (self.ref_ant,)][0]
         # Ensure that each target flux model spans all frequencies
         # in data set if possible
         self._fix_flux_freq_range()
 
-        # ------ Register applycal virtual sensors ------
+        # ------ Register applycal virtual sensors and products ------
 
-        cal_ants = attrs.get('cal_antlist', [])
-        cal_pols = attrs.get('cal_pol_ordering', [])
-        freqs = self.spectral_windows[0].channel_freqs
-        add_applycal_sensors(self.sensor, cal_ants, cal_pols, freqs)
+        cal_freqs = self._register_standard_cal_streams(gaincal_flux)
+        normalised_cal_products, skip_missing_products = _normalise_cal_products(
+            applycal, cal_freqs.keys())
+        if not self.source.data or not normalised_cal_products:
+            self._corrections = None
+            self._corrected = self.source.data
+        else:
+            freqs = self.spectral_windows[0].channel_freqs
+            corrprods = self.subarrays[self.subarray].corr_products
+            self.applycal_products, self._corrections = calc_correction(
+                self.source.data.vis.chunks, self.sensor, corrprods,
+                normalised_cal_products, freqs, cal_freqs, skip_missing_products)
+            if self._corrections is None:
+                self._corrected = self.source.data
+            else:
+                corrected_vis = self._make_corrected(apply_vis_correction,
+                                                     self.source.data.vis)
+                corrected_flags = self._make_corrected(apply_flags_correction,
+                                                       self.source.data.flags)
+                corrected_weights = self._make_corrected(apply_weights_correction,
+                                                         self.source.data.weights)
+                name = self.source.data.name
+                # Acknowledge that the applycal step is making the L1 product
+                if 'sdp_l0' in name:
+                    name = name.replace('sdp_l0', 'sdp_l1')
+                else:
+                    name = name + ' (corrected)'
+                self._corrected = VisFlagsWeights(corrected_vis, corrected_flags,
+                                                  corrected_weights, name=name)
 
         # Apply default selection and initialise all members that depend
         # on selection in the process
         self.select(spw=0, subarray=0, ants=obs_ants)
+
+    def _register_standard_cal_streams(self, gaincal_flux):
+        """Find L1 and L2 cal streams and register their virtual sensors."""
+        # XXX This assumes that `attrs` is a telstate and not a dict-like
+        attrs = self.source.metadata.attrs
+        # Find first L1 and L2 underlying cal streams by trawling through archived streams
+        l1_stream = ''
+        l2_streams = []
+        archived_streams = attrs.get('sdp_archived_streams', [])
+        for stream in archived_streams:
+            stream_attrs = _relative_view(attrs, stream)
+            stream_type = stream_attrs.get('stream_type')
+            if not l1_stream and stream_type == 'sdp.cal':
+                l1_stream = stream
+            elif not l2_streams and stream_type == 'sdp.continuum_image':
+                targets = stream_attrs.get('targets', {})
+                l2_streams = [attrs.join(stream, target + '_selfcal')
+                              for target in targets.values()]
+        # The default L1 cal stream, useful for older files
+        if not l1_stream:
+            l1_stream = 'cal'
+        # Register virtual sensors for all streams, noting their channelisation
+        freqs = self.spectral_windows[0].channel_freqs
+        cal_freqs = {}
+        l1_attrs = _relative_view(attrs, l1_stream)
+        l1_freqs = add_applycal_sensors(self.sensor, l1_attrs, freqs, cal_stream='l1',
+                                        cal_substreams=[l1_stream], gaincal_flux=gaincal_flux)
+        if l1_freqs is not None:
+            cal_freqs['l1'] = l1_freqs
+        if l2_streams:
+            l2_attrs = _relative_view(attrs, l2_streams[0])
+            l2_freqs = add_applycal_sensors(self.sensor, l2_attrs, freqs, cal_stream='l2',
+                                            cal_substreams=l2_streams, gaincal_flux=None)
+            if l2_freqs is not None:
+                cal_freqs['l2'] = l2_freqs
+        return cal_freqs
+
+    def _make_corrected(self, apply_correction, data):
+        return da.core.elemwise(apply_correction, data, self._corrections, dtype=data.dtype)
 
     @property
     def _flags_keep(self):
@@ -312,12 +484,7 @@ class VisibilityDataV4(DataSet):
     @_flags_keep.setter
     def _flags_keep(self, names):
         # Ensure `names` is a sequence of valid flag names (or an empty list)
-        if names == 'all':
-            names = FLAG_NAMES
-        elif names == '':
-            names == []
-        elif isinstance(names, basestring):
-            names = names.split(',')
+        names = _selection_to_list(names, all=FLAG_NAMES)
         # Create boolean list for desired flags
         selection = np.zeros(8, dtype=np.uint8)
         assert len(FLAG_NAMES) == len(selection), \
@@ -369,15 +536,15 @@ class VisibilityDataV4(DataSet):
             stage1 = (self._time_keep, self._freq_keep, self._corrprod_keep)
             if update_all:
                 # Cache dask graphs for the data fields
-                self._vis = DaskLazyIndexer(self.source.data.vis, stage1)
-                self._weights = DaskLazyIndexer(self.source.data.weights, stage1)
+                self._vis = DaskLazyIndexer(self._corrected.vis, stage1)
+                self._weights = DaskLazyIndexer(self._corrected.weights, stage1)
             flag_transforms = []
             if ~self._flags_select != 0:
                 # Copy so that the lambda isn't affected by future changes
                 select = self._flags_select.copy()
                 flag_transforms.append(lambda flags: da.bitwise_and(select, flags))
             flag_transforms.append(lambda flags: flags.view(np.bool_))
-            self._flags = DaskLazyIndexer(self.source.data.flags, stage1, flag_transforms)
+            self._flags = DaskLazyIndexer(self._corrected.flags, stage1, flag_transforms)
 
     @property
     def timestamps(self):

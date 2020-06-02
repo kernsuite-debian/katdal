@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,8 +16,8 @@
 
 """Tests for :py:mod:`katdal.lazy_indexer`."""
 from __future__ import print_function, division, absolute_import
-
 from builtins import object, range
+
 from numbers import Integral
 from functools import partial
 
@@ -123,7 +123,7 @@ class TestSimplifyIndex(object):
 
 
 def ix_(keep, shape):
-    """Extend numpy.ix_ to accept slices and single ints as well."""
+    r"""Extend numpy.ix\_ to accept slices and single ints as well."""
     # Inspired by Zarr's indexing.py (https://github.com/zarr-developers/zarr)
     keep = [slice_to_range(k, s) if isinstance(k, slice)
             else [k] if isinstance(k, Integral)

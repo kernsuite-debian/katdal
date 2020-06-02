@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,21 +16,22 @@
 
 """Data accessor class for HDF5 files produced by KAT-7 correlator."""
 from __future__ import print_function, division, absolute_import
+from builtins import zip, range
 
-from builtins import zip
-from builtins import range
-from past.builtins import basestring
 import logging
 
 import numpy as np
 import h5py
 import katpoint
 
-from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray, SpectralWindow,
-                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS, _robust_target)
+from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray,
+                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS,
+                      _robust_target, _selection_to_list)
+from .spectral_window import SpectralWindow
 from .sensordata import RecordSensorData, SensorCache, to_str
 from .categorical import CategoricalData, sensor_to_categorical
 from .lazy_indexer import LazyIndexer, LazyTransform
+from .flags import NAMES as FLAG_NAMES, DESCRIPTIONS as FLAG_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +63,10 @@ def _calc_azel(cache, name, ant):
     cache[name] = sensor_data = katpoint.deg2rad(cache.get(real_sensor))
     return sensor_data
 
+
 VIRTUAL_SENSORS = dict(DEFAULT_VIRTUAL_SENSORS)
 VIRTUAL_SENSORS.update({'Antennas/{ant}/az': _calc_azel, 'Antennas/{ant}/el': _calc_azel})
 
-FLAG_NAMES = ('reserved0', 'static', 'cam', 'reserved3', 'detected_rfi',
-              'predicted_rfi', 'reserved6', 'reserved7')
-FLAG_DESCRIPTIONS = ('reserved - bit 0', 'predefined static flag list',
-                     'flag based on live CAM information',
-                     'reserved - bit 3', 'RFI detected in the online system',
-                     'RFI predicted from space based pollutants',
-                     'reserved - bit 6', 'reserved - bit 7')
 WEIGHT_NAMES = ('precision',)
 WEIGHT_DESCRIPTIONS = ('visibility precision (inverse variance, i.e. 1 / sigma^2)',)
 
@@ -194,7 +189,7 @@ class H5DataV2(DataSet):
         self.description = self.obs_params.get('description', '')
         self.experiment_id = self.obs_params.get('experiment_id', '')
         # Get script log from History group
-        self.obs_script_log = f['History/script_log'].value['log'].tolist()
+        self.obs_script_log = f['History/script_log']['log'].tolist()
 
         # ------ Extract timestamps ------
 
@@ -243,8 +238,8 @@ class H5DataV2(DataSet):
         self._flags = markup_group['flags'] if 'flags' in markup_group else \
             dummy_dataset('dummy_flags', shape=self._vis.shape[:-1], dtype=np.uint8, value=0)
         # Obtain flag descriptions from file or recreate default flag description table
-        self._flags_description = to_str(markup_group['flags_description'][:]) if 'flags_description' in markup_group else \
-            np.array(list(zip(FLAG_NAMES, FLAG_DESCRIPTIONS)))
+        self._flags_description = to_str(markup_group['flags_description'][:]) \
+            if 'flags_description' in markup_group else np.array(list(zip(FLAG_NAMES, FLAG_DESCRIPTIONS)))
         self._flags_select = np.array([0], dtype=np.uint8)
         self._flags_keep = 'all'
 
@@ -254,8 +249,8 @@ class H5DataV2(DataSet):
         self._weights = markup_group['weights'] if 'weights' in markup_group else \
             dummy_dataset('dummy_weights', shape=self._vis.shape[:-1], dtype=np.float32, value=1.0)
         # Obtain weight descriptions from file or recreate default weight description table
-        self._weights_description = to_str(markup_group['weights_description'][:]) if 'weights_description' in markup_group else \
-            np.array(list(zip(WEIGHT_NAMES, WEIGHT_DESCRIPTIONS)))
+        self._weights_description = to_str(markup_group['weights_description'][:]) \
+            if 'weights_description' in markup_group else np.array(list(zip(WEIGHT_NAMES, WEIGHT_DESCRIPTIONS)))
         self._weights_select = []
         self._weights_keep = 'all'
 
@@ -302,6 +297,10 @@ class H5DataV2(DataSet):
         # Store antenna objects in sensor cache too, for use in virtual sensor calculations
         for ant in ants:
             self.sensor['Antennas/%s/antenna' % (ant.name,)] = CategoricalData([ant], [0, len(data_timestamps)])
+        # Extract array reference from first antenna (first 5 fields of description)
+        array_ant_fields = ['array'] + ants[0].description.split(',')[1:5]
+        array_ant = katpoint.Antenna(','.join(array_ant_fields))
+        self.sensor['Antennas/array/antenna'] = CategoricalData([array_ant], [0, len(data_timestamps)])
 
         # ------ Extract spectral windows / frequencies ------
 
@@ -470,8 +469,7 @@ class H5DataV2(DataSet):
     def _weights_keep(self, names):
         known_weights = [row[0] for row in getattr(self, '_weights_description', [])]
         # Ensure a sequence of weight names
-        names = known_weights if names == 'all' else \
-            names.split(',') if isinstance(names, basestring) else names
+        names = _selection_to_list(names, all=known_weights)
         # Create index list for desired weights
         selection = []
         for name in names:
@@ -502,12 +500,7 @@ class H5DataV2(DataSet):
             return
         known_flags = [row[0] for row in self._flags_description]
         # Ensure `names` is a sequence of valid flag names (or an empty list)
-        if names == 'all':
-            names = known_flags
-        elif names == '':
-            names == []
-        elif isinstance(names, basestring):
-            names = names.split(',')
+        names = _selection_to_list(names, all=known_flags)
         # Create boolean list for desired flags
         selection = np.zeros(8, dtype=np.uint8)
         assert len(known_flags) == len(selection), \

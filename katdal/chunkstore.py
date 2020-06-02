@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -17,19 +17,18 @@
 """Base class for accessing a store of chunks (i.e. N-dimensional arrays)."""
 
 from __future__ import print_function, division, absolute_import
+from builtins import next, zip, range, object
+from future.utils import raise_from
 
-from builtins import next
-from builtins import zip
-from builtins import range
-from builtins import object
 import contextlib
 import functools
 import uuid
+import io
 
 import numpy as np
 import dask
 import dask.array as da
-import toolz
+import dask.highlevelgraph
 
 
 class ChunkStoreError(Exception):
@@ -54,7 +53,7 @@ def _floor_power_of_two(x):
 
 
 def generate_chunks(shape, dtype, max_chunk_size, dims_to_split=None,
-                    power_of_two=False):
+                    power_of_two=False, max_dim_elements=None):
     """Generate dask chunk specification from ndarray parameters.
 
     Parameters
@@ -70,6 +69,9 @@ def generate_chunks(shape, dtype, max_chunk_size, dims_to_split=None,
     power_of_two : bool, optional
         True if chunk size should be rounded down to a power of two
         (the last chunk size along each dimension will potentially be smaller)
+    max_dim_elements : dict, optional
+        Maximum number of elements on each dimension (each key is a dimension
+        index). Dimensions that are not in `dims_to_split` are ignored.
 
     Returns
     -------
@@ -78,32 +80,41 @@ def generate_chunks(shape, dtype, max_chunk_size, dims_to_split=None,
     """
     if dims_to_split is None:
         dims_to_split = range(len(shape))
-    dataset_size = np.prod(shape) * np.dtype(dtype).itemsize
-    # The ideal number of chunks to achieve requested chunk size (can be float)
-    num_chunks = dataset_size / max_chunk_size
-    # Start with the whole array as a single big chunk
-    chunks = [(s,) for s in shape]
+    if max_dim_elements is None:
+        max_dim_elements = {}
+
+    dim_elements = list(shape)
+    for i in dims_to_split:
+        if i in max_dim_elements and max_dim_elements[i] < shape[i]:
+            if power_of_two:
+                dim_elements[i] = _floor_power_of_two(max_dim_elements[i])
+            else:
+                dim_elements[i] = max_dim_elements[i]
+    # The ideal number of elements per chunk to achieve requested chunk size
+    # (can be float).
+    max_elements = max_chunk_size / np.dtype(dtype).itemsize
     # Split the array greedily along each dimension, in order of `dims_to_split`
     for dim in dims_to_split:
-        if dim >= len(shape):
-            continue
-        if num_chunks > shape[dim] / 2:
-            # Split the dimension into the maximum number of chunks
-            chunk_sizes = (1,) * shape[dim]
+        cur_elements = int(np.prod(dim_elements))
+        if cur_elements <= max_elements:
+            break      # We have already split enough to meet the budget
+        # Compute number of elements per chunk in this dimension to exactly
+        # reach budget.
+        trg_elements_real = dim_elements[dim] * max_elements / cur_elements
+        if trg_elements_real < 1:
+            trg_elements = 1
+        elif power_of_two:
+            trg_elements = _floor_power_of_two(trg_elements_real)
         else:
-            items = np.arange(shape[dim])
-            if power_of_two:
-                # Chunk sizes will be (2^P, 2^P, 2^P, ..., 1 <= M <= 2^P)
-                chunksize_per_dim = _floor_power_of_two(shape[dim] / num_chunks)
-                chunk_indices = toolz.partition_all(chunksize_per_dim, items)
-            else:
-                # Chunk sizes generally will be (N, N, N, ..., N-1, N-1)
-                chunk_indices = np.array_split(items, np.ceil(num_chunks))
-            chunk_sizes = tuple([len(chunk) for chunk in chunk_indices])
-        chunks[dim] = chunk_sizes
-        # Update number of remaining chunks to realise
-        num_chunks /= len(chunk_sizes)
-    return tuple(chunks)
+            # Try to split into a number of equal-as-possible sized pieces
+            pieces = int(np.ceil(shape[dim] / trg_elements_real))
+            # Note: np.ceil rather than np.floor here means the max_chunk_size
+            # could be breached. It's done like this for backwards
+            # compatibility.
+            trg_elements = int(np.floor(shape[dim] / pieces))
+        dim_elements[dim] = trg_elements
+
+    return da.core.blockdims_from_blockshape(shape, dim_elements)
 
 
 def _add_offset_to_slices(func, offset):
@@ -133,8 +144,30 @@ def _scalar_to_chunk(func):
     return func_returning_chunk
 
 
+def npy_header_and_body(chunk):
+    """Prepare a chunk for low-level writing.
+
+    Returns the `.npy` header and a view of the chunk corresponding to that
+    header. The two should be concatenated (as buffer objects) to form a
+    valid `.npy` file.
+
+    This is useful for high-performance code, as it allows a chunk to be
+    encoded as a .npy file more efficiently than saving to a
+    :class:`io.BytesIO`.
+    """
+    # Note: don't use ascontiguousarray as it turns 0D into 1D.
+    # See https://github.com/numpy/numpy/issues/5300
+    chunk = np.asarray(chunk, order='C')
+    fp = io.BytesIO()
+    # TODO: have a fallback to version 2.0 if the header is too big for 1.0
+    header_fields = np.lib.format.header_data_from_array_1_0(chunk)
+    np.lib.format.write_array_header_1_0(fp, header_fields)
+    header = fp.getvalue()
+    return header, chunk
+
+
 class ChunkStore(object):
-    """Base class for accessing a store of chunks (i.e. N-dimensional arrays).
+    r"""Base class for accessing a store of chunks (i.e. N-dimensional arrays).
 
     A *chunk* is a simple (i.e. unit-stride) slice of an N-dimensional array
     known as its *parent array*. The array is identified by a string name,
@@ -158,9 +191,10 @@ class ChunkStore(object):
     - It is discouraged to have an array name that is a prefix of another name
     - Each chunk store has its own restrictions on valid characters in names:
       some treat names as URLs while others treat them as filenames. A safe
-      choice for name components should be the valid characters for S3 buckets:
+      choice for name components should be the valid characters for S3 buckets
+      (also including underscores for non-bucket components):
 
-      VALID_BUCKET = re.compile(r'^[a-zA-Z0-9.\-_]{1,255}$')
+      VALID_BUCKET = re.compile(r'^[a-z0-9][a-z0-9.\-]{2,62}$')
 
     Parameters
     ----------
@@ -412,7 +446,7 @@ class ChunkStore(object):
                 FirstBase = next(c for c in self._error_map if isinstance(e, c))
                 StandardisedError = self._error_map[FirstBase]
             prefix = 'Chunk {!r}: '.format(chunk_name) if chunk_name else ''
-            raise StandardisedError(prefix + str(e))
+            raise_from(StandardisedError(prefix + str(e)), e)
 
     def get_dask_array(self, array_name, chunks, dtype, offset=()):
         """Get dask array from the store.
@@ -461,8 +495,6 @@ class ChunkStore(object):
             Dask array of objects indicating success of transfer of each chunk
             (None indicates success, otherwise there is an exception object)
         """
-        dask_graph = dask.sharedict.ShareDict()
-        dask_graph.update(array.dask)
         # Give better names to these two very similar variables
         in_name = array.name
         out_name = array_name
@@ -475,7 +507,7 @@ class ChunkStore(object):
         graph = da.core.getem(array_name, array.chunks, put, out_name=out_name)
         # Set chunk parameter of put_chunk() to corresponding key in input array
         graph = {k: v + ((in_name,) + k[1:],) for k, v in graph.items()}
-        dask_graph.update(graph)
+        dask_graph = dask.highlevelgraph.HighLevelGraph.from_collections(out_name, graph, [array])
         # The success array has one element per chunk in the input array
         out_chunks = tuple(len(c) * (1,) for c in array.chunks)
         return da.Array(dask_graph, out_name, out_chunks, np.object)

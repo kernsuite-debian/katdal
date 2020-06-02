@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,19 +16,18 @@
 
 """Base class for accessing a visibility data set."""
 from __future__ import print_function, division, absolute_import
-
-from builtins import zip
+from builtins import zip, object
 from past.builtins import basestring
-from builtins import object
+
 import time
 import logging
 import numbers
-import threading
 
 import numpy as np
 
 import katpoint
 from katpoint import is_iterable, rad2deg
+
 
 logger = logging.getLogger(__name__)
 
@@ -110,163 +109,6 @@ class Subarray(object):
         return hash(self._description)
 
 
-class SpectralWindow(object):
-    """Spectral window specification.
-
-    A spectral window is determined by the number of frequency channels produced
-    by the correlator and their corresponding centre frequencies, as well as the
-    channel width. The channels are assumed to be regularly spaced and to be the
-    result of either lower-sideband downconversion (channel frequencies
-    decreasing with channel index) or upper-sideband downconversion (frequencies
-    increasing with index). For further information the receiver band and
-    correlator product names are also available.
-
-    .. warning::
-
-        Instances should be treated as immutable. Changing the attributes will
-        lead to inconsistencies between them.
-
-    Parameters
-    ----------
-    centre_freq : float
-        Centre frequency of spectral window, in Hz
-    channel_width : float
-        Bandwidth of each frequency channel, in Hz
-    num_chans : int
-        Number of frequency channels
-    product : string, optional
-        Name of data product / correlator mode
-    sideband : {-1, +1}, optional
-        Type of downconversion (-1 => lower sideband, +1 => upper sideband)
-    band : {'L', 'UHF', 'S', 'X', 'Ku'}, optional
-        Name of receiver / band
-    bandwidth : float, optional
-        The bandwidth of the whole spectral window, in Hz. If specified,
-        `channel_width` is ignored and computed from the bandwidth. If not
-        specified, bandwidth is computed from the channel width. Specifying
-        this is a good idea if the channel width cannot be exactly represented
-        in floating point.
-
-    Attributes
-    ----------
-    channel_freqs : array of float, shape (*F*,)
-        Centre frequency of each frequency channel (assuming LSB mixing), in Hz
-    """
-
-    def __init__(self, centre_freq, channel_width, num_chans, product=None,
-                 sideband=-1, band='L', bandwidth=None):
-        if bandwidth is None:
-            bandwidth = channel_width * num_chans
-        else:
-            channel_width = bandwidth / num_chans
-        self.centre_freq = centre_freq
-        self.channel_width = channel_width
-        self.bandwidth = bandwidth
-        self.num_chans = num_chans
-        self.product = product if product is not None else ''
-        self.sideband = sideband
-        self.band = band
-        # channel_freqs is computed on demand
-        self._channel_freqs_lock = threading.Lock()
-        self._channel_freqs = None
-
-    @property
-    def channel_freqs(self):
-        with self._channel_freqs_lock:
-            if self._channel_freqs is None:
-                # Don't subtract half a channel width as channel 0 is centred on 0 Hz in baseband
-                # We use self.bandwidth and self.num_chans to avoid rounding
-                # errors that might accumulate if channel_width is inexact.
-                self._channel_freqs = self.centre_freq + self.sideband * self.bandwidth * (
-                    np.arange(self.num_chans) - self.num_chans // 2) / self.num_chans
-            return self._channel_freqs
-
-    def __repr__(self):
-        """Short human-friendly string representation of spectral window object."""
-        return "<katdal.SpectralWindow %s-band product=%s centre=%.3f MHz " \
-               "bandwidth=%.3f MHz channels=%d at 0x%x>" % \
-               (self.band if self.band else 'unknown',
-                repr(self.product) if self.product else 'unknown',
-                self.centre_freq / 1e6,
-                self.bandwidth / 1e6,
-                self.num_chans, id(self))
-
-    @property
-    def _description(self):
-        """Complete hashable representation, used internally for comparisons."""
-        # Pick values that enable a sensible ordering of spectral windows
-        # Using self.bandwidth is generally redundant but may play a role in
-        # obscure rounding cases.
-        return (self.centre_freq,
-                -self.channel_width, self.num_chans, self.sideband,
-                self.band, self.product, -self.bandwidth)
-
-    def __eq__(self, other):
-        """Equality comparison operator."""
-        return self._description == (
-            other._description if isinstance(other, SpectralWindow) else other)
-
-    def __ne__(self, other):
-        """Inequality comparison operator."""
-        return not (self == other)
-
-    def __lt__(self, other):
-        """Less-than comparison operator (needed for sorting and np.unique)."""
-        return self._description < (
-            other._description if isinstance(other, SpectralWindow) else other)
-
-    def __hash__(self):
-        """Base hash on description tuple, just like equality operator."""
-        return hash(self._description)
-
-    def subrange(self, first, last):
-        """Get a new :class:`SpectralWindow` representing a subset of the channels.
-
-        The returned :class:`SpectralWindow` covers the same frequencies as
-        channels [first, last) of the original.
-
-        Raises
-        ------
-        IndexError
-            If [first, last) is not a (non-empty) subinterval of the channels
-        """
-        if not (0 <= first < last <= self.num_chans):
-            raise IndexError('channel indices out of range')
-        channel_shift = (first + last) // 2 - self.num_chans // 2
-        num_chans = last - first
-        # We use self.bandwidth and self.num_chans to avoid rounding errors
-        # that might accumulate if channel_width is inexact.
-        centre_freq = self.centre_freq \
-            + channel_shift * self.bandwidth * self.sideband / self.num_chans
-        return SpectralWindow(
-            centre_freq, self.channel_width, num_chans,
-            self.product, self.sideband, self.band,
-            bandwidth=self.bandwidth * num_chans / self.num_chans)
-
-    def rechannelise(self, num_chans):
-        """Get a new :class:`SpectralWindow` with a different number of channels.
-
-        The returned :class:`SpectralWindow` covers the same frequencies as the
-        original, but dividing the bandwidth into a different number of
-        channels.
-        """
-        if num_chans == self.num_chans:
-            return self
-        # Find the centre of the bandwidth (whereas centre_freq is the centre
-        # of the middle channel)
-        centre_freq = self.centre_freq
-        if self.num_chans % 2 == 0:
-            centre_freq -= self.sideband * 0.5 * self.channel_width
-        channel_width = self.bandwidth / num_chans
-        # Now convert to the centre of the new middle channel
-        if num_chans % 2 == 0:
-            centre_freq += self.sideband * 0.5 * channel_width
-        return SpectralWindow(
-            centre_freq, channel_width, num_chans,
-            self.product, self.sideband, self.band,
-            bandwidth=self.bandwidth)
-
-
 def _robust_target(description):
     """Robust build of :class:`katpoint.Target` object from description string."""
     if not description:
@@ -276,6 +118,34 @@ def _robust_target(description):
     except ValueError:
         logger.warning("Invalid target description '%s' - replaced with dummy target" % (description,))
         return katpoint.Target('Nothing, special')
+
+
+def _selection_to_list(names, **groups):
+    """Normalise string of comma-separated names or sequence of names / objects.
+
+    Parameters
+    ----------
+    names : string / object or sequence of strings / objects
+        A string of comma-separated names or a sequence of names / objects
+    groups : dict, optional
+        Each extra keyword is the name of a predefined list of names / objects
+
+    Returns
+    -------
+    list : list of strings / objects
+        List of names / objects
+    """
+    if isinstance(names, basestring):
+        if not names:
+            return []
+        elif names in groups:
+            return list(groups[names])
+        else:
+            return [name.strip() for name in names.split(',')]
+    elif is_iterable(names):
+        return list(names)
+    else:
+        return [names]
 
 
 DEFAULT_SENSOR_PROPS = {
@@ -294,7 +164,8 @@ DEFAULT_SENSOR_PROPS = {
 
 def _calc_mjd(cache, name):
     """Calculate Modified Julian Day (MJD) timestamps using sensor cache contents."""
-    cache[name] = mjd = np.array([katpoint.Timestamp(t).to_mjd() for t in cache.timestamps[:]])
+    cache[name] = mjd = np.array([katpoint.Timestamp(t).to_mjd()
+                                  for t in cache.timestamps[:]])
     return mjd
 
 
@@ -309,19 +180,21 @@ def _calc_radec(cache, name, ant):
     """Calculate (ra, dec) pointing coordinates using sensor cache contents."""
     ant_group = 'Antennas/%s/' % (ant,)
     antenna = cache.get(ant_group + 'antenna')[0]
-    az, el = cache.get(ant_group + 'az'), cache.get(ant_group + 'el')
-    radec = np.array([katpoint.construct_azel_target(a, e).radec(t, antenna)
-                      for t, a, e in zip(cache.timestamps[:], az, el)])
-    cache[ant_group + 'ra'] = radec[:, 0]
-    cache[ant_group + 'dec'] = radec[:, 1]
-    return radec[:, 0] if name == ant_group + 'ra' else radec[:, 1]
+    az = cache.get(ant_group + 'az')
+    el = cache.get(ant_group + 'el')
+    ra, dec = np.array([katpoint.construct_azel_target(a, e).radec(t, antenna)
+                        for t, a, e in zip(cache.timestamps[:], az, el)]).T
+    cache[ant_group + 'ra'] = ra
+    cache[ant_group + 'dec'] = dec
+    return ra if name.endswith('ra') else dec
 
 
 def _calc_parangle(cache, name, ant):
     """Calculate parallactic angle using sensor cache contents."""
     ant_group = 'Antennas/%s/' % (ant,)
     antenna = cache.get(ant_group + 'antenna')[0]
-    az, el = cache.get(ant_group + 'az'), cache.get(ant_group + 'el')
+    az = cache.get(ant_group + 'az')
+    el = cache.get(ant_group + 'el')
     parangle = np.array([katpoint.construct_azel_target(a, e).parallactic_angle(t, antenna)
                          for t, a, e in zip(cache.timestamps[:], az, el)])
     cache[name] = parangle
@@ -332,34 +205,57 @@ def _calc_target_coords(cache, name, ant, projection, coordsys):
     """Calculate target coordinates using sensor cache contents."""
     ant_group = 'Antennas/%s/' % (ant,)
     antenna = cache.get(ant_group + 'antenna')[0]
-    lon = cache.get(ant_group + 'ra') if coordsys == 'radec' else cache.get(ant_group + 'az')
-    lat = cache.get(ant_group + 'dec') if coordsys == 'radec' else cache.get(ant_group + 'el')
+    if coordsys == 'radec':
+        lon = cache.get(ant_group + 'ra')
+        lat = cache.get(ant_group + 'dec')
+    else:
+        lon = cache.get(ant_group + 'az')
+        lat = cache.get(ant_group + 'el')
     # Fix over-the-top elevations (projections can only handle elevations in range +- 90 degrees)
     over_the_top = (lat > np.pi / 2.0) & (lat < np.pi)
     lon[over_the_top] += np.pi
     lat[over_the_top] = np.pi - lat[over_the_top]
-    x, y = np.empty(len(cache.timestamps)), np.empty(len(cache.timestamps))
+    x = np.empty(len(cache.timestamps))
+    y = np.empty(len(cache.timestamps))
     targets = cache.get('Observation/target')
     for segm, target in targets.segments():
-        x[segm], y[segm] = target.sphere_to_plane(lon[segm], lat[segm], cache.timestamps[segm],
+        x[segm], y[segm] = target.sphere_to_plane(lon[segm], lat[segm],
+                                                  cache.timestamps[segm],
                                                   antenna, projection, coordsys)
     cache[ant_group + 'target_x_%s_%s' % (projection, coordsys)] = x
     cache[ant_group + 'target_y_%s_%s' % (projection, coordsys)] = y
     return x if name.startswith(ant_group + 'target_x') else y
 
 
-def _calc_uvw(cache, name, antA, antB):
-    """Calculate (u,v,w) coordinates using sensor cache contents."""
-    antA_group, antB_group = 'Antennas/%s/' % (antA,), 'Antennas/%s/' % (antB,)
-    antennaA, antennaB = cache.get(antA_group + 'antenna')[0], cache.get(antB_group + 'antenna')[0]
-    u, v, w = np.empty(len(cache.timestamps)), np.empty(len(cache.timestamps)), np.empty(len(cache.timestamps))
+def _calc_uvw_basis(cache, name, ant):
+    """Calculate (u,v,w) basis vectors using sensor cache contents."""
+    ant_group = 'Antennas/%s/' % (ant,)
+    antenna = cache.get(ant_group + 'antenna')[0]
+    u = np.empty((len(cache.timestamps), 3))
+    v = np.empty((len(cache.timestamps), 3))
+    w = np.empty((len(cache.timestamps), 3))
     targets = cache.get('Observation/target')
     for segm, target in targets.segments():
-        u[segm], v[segm], w[segm] = target.uvw(antennaA, cache.timestamps[segm], antennaB)
-    cache[antA_group + 'u_%s' % (antB,)] = u
-    cache[antA_group + 'v_%s' % (antB,)] = v
-    cache[antA_group + 'w_%s' % (antB,)] = w
-    return u if name.startswith(antA_group + 'u') else v if name.startswith(antA_group + 'v') else w
+        # The basis is a series of 3x3 matrices converting ENU to UVW
+        basis = target.uvw_basis(cache.timestamps[segm], antenna)
+        # Basis has shape (3, 3, T) which we split into 3 sensors of shape (T, 3)
+        u[segm], v[segm], w[segm] = basis.transpose(0, 2, 1)
+    new_sensors = {ant_group + 'basis_u': u, ant_group + 'basis_v': v,
+                   ant_group + 'basis_w': w}
+    cache.update(new_sensors)
+    return new_sensors[name]
+
+
+def _calc_uvw_per_ant(cache, name, ant):
+    """Calculate (u,v,w) coordinates per antenna using sensor cache contents."""
+    array_antenna = cache.get('Antennas/array/antenna')[0]
+    antenna = cache.get('Antennas/%s/antenna' % (ant,))[0]
+    basis = cache.get('Antennas/array/basis_' + name[-1])
+    # Obtain baseline vector from array reference to specified antenna
+    baseline_m = array_antenna.baseline_toward(antenna)
+    coord = basis.dot(baseline_m)
+    cache[name] = coord
+    return coord
 
 
 DEFAULT_VIRTUAL_SENSORS = {
@@ -367,7 +263,8 @@ DEFAULT_VIRTUAL_SENSORS = {
     'Antennas/{ant}/ra': _calc_radec, 'Antennas/{ant}/dec': _calc_radec,
     'Antennas/{ant}/parangle': _calc_parangle,
     'Antennas/{ant}/target_[xy]_{projection}_{coordsys}': _calc_target_coords,
-    'Antennas/{antA}/[uvw]_{antB}': _calc_uvw,
+    'Antennas/{ant}/basis_[uvw]': _calc_uvw_basis,
+    'Antennas/{ant}/[uvw]': _calc_uvw_per_ant,
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -461,6 +358,8 @@ class DataSet(object):
         Shape of selected visibility data array, as (*T*, *F*, *B*)
     size : int
         Size of selected visibility data array, in bytes
+    applycal_products : list of string
+        List of calibration products that will be applied to data
 
     """
 
@@ -501,6 +400,7 @@ class DataSet(object):
         self.target_coordsys = 'azel'
         self.shape = (0, 0, 0)
         self.size = 0
+        self.applycal_products = []
 
         self._selection = {}
         self._time_keep = []
@@ -829,7 +729,7 @@ class DataSet(object):
                 self._time_keep &= (self.sensor.timestamps[:] >= start_time)
                 self._time_keep &= (self.sensor.timestamps[:] <= end_time)
             elif k in ('scans', 'compscans'):
-                scans = v if is_iterable(v) else [l.strip() for l in v.split(',')] if isinstance(v, basestring) else [v]
+                scans = _selection_to_list(v)
                 scan_keep = np.zeros(len(self._time_keep), dtype=np.bool)
                 scan_sensor = self.sensor.get('Observation/scan_state' if k == 'scans' else 'Observation/label')
                 scan_index_sensor = self.sensor.get('Observation/%s_index' % (k[:-1],))
@@ -846,16 +746,17 @@ class DataSet(object):
                 target_keep = np.zeros(len(self._time_keep), dtype=np.bool)
                 target_index_sensor = self.sensor.get('Observation/target_index')
                 for t in targets:
-                    if isinstance(t, numbers.Integral):
-                        target_index = t
-                    elif t not in self.catalogue:
+                    try:
+                        if isinstance(t, numbers.Integral):
+                            target_index = t
+                        elif isinstance(t, katpoint.Target) or isinstance(t, basestring) and ',' in t:
+                            target_index = self.catalogue.targets.index(t)
+                        else:
+                            target_index = self.catalogue.targets.index(self.catalogue[t])
+                    except (KeyError, ValueError):
                         # Warn here, in case the user gets the target subtly wrong and wonders why it is not selected
-                        logger.warning("Skipping unknown selected target '%s'" % (t,))
+                        logger.warning("Skipping unknown selected target '%s'", t)
                         continue
-                    elif isinstance(t, katpoint.Target) or isinstance(t, basestring) and ',' in t:
-                        target_index = self.catalogue.targets.index(t)
-                    else:
-                        target_index = self.catalogue.targets.index(self.catalogue[t])
                     target_keep |= (target_index_sensor == target_index)
                 self._time_keep &= target_keep
             # Selections that affect frequency axis
@@ -892,16 +793,16 @@ class DataSet(object):
                         cp_keep[v] = True
                         self._corrprod_keep &= cp_keep
             elif k == 'ants':
-                ants = [a.strip() for a in v.split(',')] if isinstance(v, basestring) else v if is_iterable(v) else [v]
+                ants = _selection_to_list(v)
                 ant_names = [(ant.name if isinstance(ant, katpoint.Antenna) else ant) for ant in ants]
                 self._corrprod_keep &= [(inpA[:-1] in ant_names and inpB[:-1] in ant_names)
                                         for inpA, inpB in self.subarrays[self.subarray].corr_products]
             elif k == 'inputs':
-                inps = [i.strip() for i in v.split(',')] if isinstance(v, basestring) else v if is_iterable(v) else [v]
+                inps = _selection_to_list(v)
                 self._corrprod_keep &= [(inpA in inps and inpB in inps)
                                         for inpA, inpB in self.subarrays[self.subarray].corr_products]
             elif k == 'pol':
-                pols = [i.strip() for i in v.split(',')] if isinstance(v, basestring) else v if is_iterable(v) else [v]
+                pols = _selection_to_list(v)
                 # Lower case and strip out empty strings
                 pols = [i.lower() for i in pols if i]
 
@@ -914,7 +815,7 @@ class DataSet(object):
                     for polAB in pols:
                         polAB = polAB * 2 if polAB in ('h', 'v') else polAB
                         keep |= [(inpA[-1] == polAB[0] and inpB[-1] == polAB[1])
-                                               for inpA, inpB in self.subarrays[self.subarray].corr_products]
+                                 for inpA, inpB in self.subarrays[self.subarray].corr_products]
 
                     # and into final corrprod selection
                     self._corrprod_keep &= keep
@@ -925,8 +826,6 @@ class DataSet(object):
             elif k == 'flags':
                 self._flags_keep = v
 
-        # Ensure that updated selections make their way to sensor cache and potentially underlying datasets
-        self._set_keep(self._time_keep, self._freq_keep, self._corrprod_keep, self._weights_keep, self._flags_keep)
         # Update the relevant data members based on selection made
         # These would all be more efficient as properties, but at the expense of extra lines of code...
         self.shape = (self._time_keep.sum(), self._freq_keep.sum(), self._corrprod_keep.sum())
@@ -942,6 +841,10 @@ class DataSet(object):
         self.inputs = sorted(set(np.ravel(self.corr_products)))
         input_ants = set([inp[:-1] for inp in self.inputs])
         self.ants = [ant for ant in self.subarrays[self.subarray].ants if ant.name in input_ants]
+        # Ensure that updated selections make their way to sensor cache, as
+        # well as any underlying datasets and data lazy indexers that need it
+        self._set_keep(self._time_keep, self._freq_keep, self._corrprod_keep,
+                       self._weights_keep, self._flags_keep)
         # Figure out which scans, compscans and targets are included in selection
         self.scan_indices = sorted(set(self.sensor['Observation/scan_index']))
         self.compscan_indices = sorted(set(self.sensor['Observation/compscan_index']))
@@ -1127,7 +1030,7 @@ class DataSet(object):
     def lst(self):
         """Local sidereal time at the reference antenna in hours.
 
-        The sidereal times are returned in an array of float, shape (*T*, *A*).
+        The sidereal times are returned in an array of float, shape (*T*,).
 
         """
         return self.sensor['Antennas/%s/lst' % self.ref_ant] * (12 / np.pi)
@@ -1139,11 +1042,18 @@ class DataSet(object):
         return np.column_stack([sensor_data(ant.name) for ant in self.ants]) \
             if self.ants else np.zeros((self.shape[0], 0))
 
-    def _sensor_per_corrprod(self, base_name):
-        """Extract a single sensor per corrprod and safely stack the results."""
-        def sensor_data(antA, antB):
-            return self.sensor['Antennas/%s/%s_%s' % (antA, base_name, antB)]
-        return np.column_stack([sensor_data(inpA[:-1], inpB[:-1])
+    def _delta_sensor_per_corrprod(self, base_name):
+        """Extract a single sensor per corrprod and safely stack the results.
+
+        The sensor is specialised to return the difference between the sensors
+        of the two antennas making up the correlation product, since that is
+        what (u, v, w) sensors need.
+        """
+        def difference(antA, antB):
+            coord1 = self.sensor['Antennas/%s/%s' % (antA, base_name)]
+            coord2 = self.sensor['Antennas/%s/%s' % (antB, base_name)]
+            return coord1 - coord2
+        return np.column_stack([difference(inpA[:-1], inpB[:-1])
                                 for inpA, inpB in self.corr_products]) \
             if len(self.corr_products) else np.zeros((self.shape[0], 0))
 
@@ -1240,7 +1150,7 @@ class DataSet(object):
         convention is :math:`u_1 - u_2` for baseline (ant1, ant2).
 
         """
-        return self._sensor_per_corrprod('u')
+        return self._delta_sensor_per_corrprod('u')
 
     @property
     def v(self):
@@ -1252,7 +1162,7 @@ class DataSet(object):
         convention is :math:`v_1 - v_2` for baseline (ant1, ant2).
 
         """
-        return self._sensor_per_corrprod('v')
+        return self._delta_sensor_per_corrprod('v')
 
     @property
     def w(self):
@@ -1264,4 +1174,4 @@ class DataSet(object):
         convention is :math:`w_1 - w_2` for baseline (ant1, ant2).
 
         """
-        return self._sensor_per_corrprod('w')
+        return self._delta_sensor_per_corrprod('w')

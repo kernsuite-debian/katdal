@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2018-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -21,12 +21,12 @@ pass visibility data to a separate process that actually writes to the
 measurement set.
 
 This is largely an implementation detail of the mvftoms.py script, and might
-might be suited to other use cases. It is put into a separate module as a
+not be suited to other use cases. It is put into a separate module as a
 workaround for https://bugs.python.org/issue9914.
 """
 from __future__ import print_function, division, absolute_import
-
 from builtins import object
+
 from collections import namedtuple
 import contextlib
 import multiprocessing
@@ -108,12 +108,9 @@ def ms_writer_process(
         tdiff = vis_arrays.shape[1]
         nbl = vis_arrays.shape[2]
 
-        main_table = ms_extra.open_main(ms_name, verbose=options.verbose)
+        main_table = ms_extra.open_table(ms_name, verbose=options.verbose)
         with contextlib.closing(main_table):
-            array_centre = katpoint.Antenna('', *antennas[0].ref_position_wgs84)
-            baseline_vectors = np.array([array_centre.baseline_toward(antenna)
-                                         for antenna in antennas])
-
+            array_centre = antennas[0].array_reference_antenna()
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -131,12 +128,13 @@ def ms_writer_process(
                     flag_data = flag_arrays[item.slot].reshape(new_shape)
 
                     # Iterate through baselines, computing UVW coordinates
-                    # for a chunk of timesteps
-                    uvw_basis = item.target.uvw_basis(item.time_utc, array_centre)
-                    # Axes in uvw_ant are antenna, axis (u/v/w), and time
-                    uvw_ant = np.tensordot(baseline_vectors, uvw_basis, ([1], [1]))
-                    # Permute to time, antenna, axis
-                    uvw_ant = np.transpose(uvw_ant, (2, 0, 1))
+                    # for a chunk of timesteps. Note that we can't rely on the
+                    # u, v, w properties of the dataset because those
+                    # correspond to the original dumps, and we might be
+                    # averaging in time.
+                    uvw_ant = item.target.uvw(antennas, item.time_utc, array_centre)
+                    # Permute from axis, time, antenna to time, antenna, axis
+                    uvw_ant = np.transpose(uvw_ant, (1, 2, 0))
                     # Compute baseline UVW coordinates from per-antenna coordinates.
                     # The sign convention matches `CASA`_, rather than the
                     # Measurement Set `definition`_.
@@ -176,7 +174,7 @@ def ms_writer_process(
                     # Populate dictionary for write to MS
                     main_dict = ms_extra.populate_main_dict(
                         uvw_coordinates, vis_data,
-                        flag_data, out_mjd, a1, a2,
+                        flag_data, weight_data, out_mjd, a1, a2,
                         item.dump_time_width, big_field_id, big_state_id,
                         big_scan_itr, model_data, corrected_data)
 

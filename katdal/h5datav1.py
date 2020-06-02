@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2018, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,9 +16,8 @@
 
 """Data accessor class for HDF5 files produced by Fringe Finder correlator."""
 from __future__ import print_function, division, absolute_import
+from builtins import zip, range
 
-from builtins import zip
-from builtins import range
 import logging
 import re
 
@@ -26,8 +25,10 @@ import numpy as np
 import h5py
 import katpoint
 
-from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray, SpectralWindow,
-                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS, _robust_target)
+from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray,
+                      DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS,
+                      _robust_target)
+from .spectral_window import SpectralWindow
 from .sensordata import RecordSensorData, SensorCache, to_str
 from .categorical import CategoricalData
 from .lazy_indexer import LazyIndexer, LazyTransform
@@ -44,6 +45,7 @@ def _labels_to_state(scan_label, compscan_label):
         return 'track'
     return 'track' if compscan_label == 'track' else 'scan'
 
+
 SENSOR_PROPS = dict(DEFAULT_SENSOR_PROPS)
 
 SENSOR_ALIASES = {
@@ -57,6 +59,7 @@ def _calc_azel(cache, name, ant):
     real_sensor = 'Antennas/%s/%s' % (ant, 'pos_actual_scan_azim' if name.endswith('az') else 'pos_actual_scan_elev')
     cache[name] = sensor_data = katpoint.deg2rad(cache.get(real_sensor))
     return sensor_data
+
 
 VIRTUAL_SENSORS = dict(DEFAULT_VIRTUAL_SENSORS)
 VIRTUAL_SENSORS.update({'Antennas/{ant}/az': _calc_azel, 'Antennas/{ant}/el': _calc_azel})
@@ -195,6 +198,10 @@ class H5DataV1(DataSet):
         # Store antenna objects in sensor cache too, for use in virtual sensor calculations
         for ant in ants:
             self.sensor['Antennas/%s/antenna' % (ant.name,)] = CategoricalData([ant], [0, len(data_timestamps)])
+        # Extract array reference from first antenna (first 5 fields of description)
+        array_ant_fields = ['array'] + ants[0].description.split(',')[1:5]
+        array_ant = katpoint.Antenna(','.join(array_ant_fields))
+        self.sensor['Antennas/array/antenna'] = CategoricalData([array_ant], [0, len(data_timestamps)])
 
         # ------ Extract spectral windows / frequencies ------
 
