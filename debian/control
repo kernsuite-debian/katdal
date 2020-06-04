@@ -2,19 +2,39 @@ Source: katdal
 Section: python
 Priority: optional
 Maintainer: Gijs Molenaar <gijs@pythonic.nl>
-Build-Depends: debhelper (>= 9), dh-python, python-all, python-setuptools,
- python-katversion, python-katpoint
-Standards-Version: 3.9.4
+Build-Depends: debhelper (>= 9),
+ dh-python,
+ python-all,
+ python-setuptools,
+ python3-setuptools,
+ python-katversion,
+ python3-katversion,
+ python-katpoint,
+ python3-katpoint
+Standards-Version: 4.4.1
 Homepage: https://github.com/ska-sa/katdal
 Vcs-Git: git://github.com/kernsuite-debian/katdal.git
 Vcs-Browser: https://github.com/kernsuite-debian/katdal
 X-Python-Version: >= 2.7
+X-Python3-Version: >= 3.6
 
 Package: python-katdal
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${python:Depends},
  python-katversion, python-katpoint, python-casacore
-Description: Data access library for the MeerKAT project 
+Description: Data access library for the MeerKAT project
+ This package serves as a data access library to the HDF5 files produced by the
+ Fringe Finder, KAT-7 and MeerKAT data capturing systems. It uses memory
+ carefully, allowing files to be inspected and partially loaded into memory.
+ Data sets may be concatenated and split via a flexible selection mechanism.
+ In addition, it provides a script to convert these HDF5 files to CASA
+ MeasurementSets.
+
+Package: python3-katdal
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${python3:Depends},
+ python-katversion, python-katpoint, python-casacore
+Description: Data access library for the MeerKAT project
  This package serves as a data access library to the HDF5 files produced by the
  Fringe Finder, KAT-7 and MeerKAT data capturing systems. It uses memory
  carefully, allowing files to be inspected and partially loaded into memory.
