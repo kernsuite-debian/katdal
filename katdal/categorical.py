@@ -21,6 +21,7 @@ from builtins import zip, range, object
 import collections
 
 import numpy as np
+from dask.base import tokenize
 
 
 class ComparableArrayWrapper(object):
@@ -35,7 +36,7 @@ class ComparableArrayWrapper(object):
       - It ensures that array-valued sensor values become properly comparable
         (avoiding array-valued booleans resulting from standard comparisons).
 
-    The former is needed because :class:`SensorData` is treated as a structured
+    The former is needed because :class:`SensorGetter` is treated as a structured
     array even if it contains object values. The latter is needed because the
     equality operator crops up in hard-to-reach places like inside list.index().
 
@@ -119,7 +120,7 @@ def infer_dtype(values):
     ----------
     values : sequence, or object with dtype
         Sequence of sensor values (typically a list), or a sensor data object
-        with a dtype attribute (like ndarray or :class:`SensorData`)
+        with a dtype attribute (like ndarray or :class:`SensorGetter`)
 
     Returns
     -------
@@ -136,7 +137,7 @@ def infer_dtype(values):
     as opposed to being unpacked across the argument list.
 
     """
-    # If values already has a dtype (because it is an ndarray, SensorData,
+    # If values already has a dtype (because it is an ndarray, SensorGetter,
     # CategoricalData, etc), return that instead
     if hasattr(values, 'dtype'):
         return values.dtype
@@ -179,12 +180,15 @@ def unique_in_order(elements, return_inverse=False):
         # Surprisingly, a zero generator like itertools.repeat does not buy you anything
         lookup = collections.OrderedDict(zip(elements, len(elements) * [0]))
     except TypeError:
-        # Fall back to slower list-based lookup for unhashable object values
+        # Fall back to slower lookup using dask's tokenizer
+        lookup = {}
         for element in elements:
+            token = tokenize(ComparableArrayWrapper.unwrap(element))
             try:
-                index = unique_elements.index(element)
-            except ValueError:
+                index = lookup[token]
+            except KeyError:
                 index = len(unique_elements)
+                lookup[token] = index
                 unique_elements.append(element)
             if return_inverse:
                 inverse.append(index)

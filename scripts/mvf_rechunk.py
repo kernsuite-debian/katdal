@@ -27,7 +27,7 @@ from katdal.flags import DATA_LOST
 
 class RechunkSpec(object):
     def __init__(self, arg):
-        match = re.match(r'^([A-Za-z0-9_]+)/([A-Za-z0-9_]+):(\d+),(\d+)', arg)
+        match = re.match(r'^([A-Za-z0-9_.]+)/([A-Za-z0-9_]+):(\d+),(\d+)', arg)
         if not match:
             raise ValueError('Could not parse {!r}'.format(arg))
         self.stream = match.group(1)
@@ -38,6 +38,22 @@ class RechunkSpec(object):
             raise ValueError('Chunk sizes must be positive')
 
 
+def _fill_missing(data, default_value, block_info):
+    if data is None:
+        info = block_info[None]
+        return np.full(info['chunk-shape'], default_value, info['dtype'])
+    else:
+        return data
+
+
+def _make_lost(data, block_info):
+    info = block_info[None]
+    if data is None:
+        return np.full(info['chunk-shape'], DATA_LOST, np.uint8)
+    else:
+        return np.zeros(info['chunk-shape'], np.uint8)
+
+
 class Array(object):
     def __init__(self, stream_name, array_name, store, chunk_info):
         self.stream_name = stream_name
@@ -45,22 +61,15 @@ class Array(object):
         self.chunk_info = chunk_info
         self.store = store
         full_name = store.join(chunk_info['prefix'], array_name)
-        shape = chunk_info['shape']
         chunks = chunk_info['chunks']
         dtype = chunk_info['dtype']
-        self.data = store.get_dask_array(full_name, chunks, dtype)
-        self.has_data = store.has_array(full_name, chunks, dtype)
-        self.lost_flags = da.map_blocks(
-            self._make_lost, chunks=chunks, dtype=np.uint8,
-            name='lost-flags-{}-{}'.format(self.stream_name, self.array_name))
-
-    def _make_lost(self, block_info):
-        loc = block_info[None]['array-location']
-        shape = block_info[None]['chunk-shape']
-        if self.has_data[block_info[None]['chunk-location']]:
-            return np.zeros(shape, np.uint8)
-        else:
-            return np.full(shape, DATA_LOST, np.uint8)
+        raw_data = store.get_dask_array(full_name, chunks, dtype, errors='none')
+        # raw_data has `None` objects instead of ndarrays for chunks with
+        # missing data. That's not actually valid as a dask array, but we use
+        # it to produce lost flags (similarly to datasources.py).
+        default_value = DATA_LOST if array_name == 'flags' else 0
+        self.data = da.map_blocks(_fill_missing, raw_data, default_value, dtype=raw_data.dtype)
+        self.lost_flags = da.map_blocks(_make_lost, raw_data, dtype=np.uint8)
 
 
 def get_chunk_store(source, telstate, array):
@@ -96,12 +105,23 @@ def parse_args():
     return args
 
 
+def get_stream_type(telstate, stream):
+    try:
+        return telstate.view(stream)['stream_type']
+    except KeyError:
+        try:
+            base = telstate.view(stream)['inherit']
+            return get_stream_type(telstate, base)
+        except KeyError:
+            return None
+
+
 def get_streams(telstate, streams):
     """Determine streams to copy based on what the user asked for"""
     archived_streams = telstate.get('sdp_archived_streams', [])
     archived_streams = [
         stream for stream in archived_streams
-        if telstate.view(stream).get('stream_type') in {'sdp.vis', 'sdp.flags'}]
+        if get_stream_type(telstate, stream) in {'sdp.vis', 'sdp.flags'}]
     if not archived_streams:
         raise RuntimeError('Source dataset does not contain any visibility streams')
     if streams is None:

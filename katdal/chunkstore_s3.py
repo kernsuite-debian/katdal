@@ -30,13 +30,10 @@ import urllib.request
 import urllib.error
 import hashlib
 import base64
-import warnings
 import copy
 import json
 import time
 
-import defusedxml.ElementTree
-import defusedxml.cElementTree
 import numpy as np
 import requests
 import jwt
@@ -416,7 +413,9 @@ class S3ChunkStore(ChunkStore):
     url : str
         Endpoint of S3 service, e.g. 'http://127.0.0.1:9000'. It can be
         specified as either bytes or unicode, and is converted to the native
-        string type with UTF-8.
+        string type with UTF-8. The URL may also contain a path if this store is
+        relative to an existing bucket, in which case the chunk name is a relative
+        path (useful for unit tests).
     timeout : float or tuple of 2 floats, optional
         Connect / read timeout, in seconds, either a single value for both or
         custom values as (connect, read) tuple (set to None to leave unchanged)
@@ -445,8 +444,7 @@ class S3ChunkStore(ChunkStore):
 
     def __init__(self, url, timeout=(30, 300), retries=2, token=None,
                  credentials=None, public_read=False, expiry_days=0, **kwargs):
-        error_map = {requests.exceptions.RequestException: StoreUnavailable,
-                     defusedxml.ElementTree.ParseError: StoreUnavailable}
+        error_map = {requests.exceptions.RequestException: StoreUnavailable}
         super(S3ChunkStore, self).__init__(error_map)
         auth = _auth_factory(url, token, credentials)
         if not isinstance(retries, Retry):
@@ -477,8 +475,9 @@ class S3ChunkStore(ChunkStore):
         self.public_read = public_read
         self.expiry_days = int(expiry_days)
 
-    def _chunk_url(self, chunk_name):
-        return urllib.parse.urljoin(self._url, to_str(urllib.parse.quote(chunk_name + '.npy')))
+    def _chunk_url(self, chunk_name, extension='.npy'):
+        """Assemble URL corresponding to chunk (or array) name."""
+        return urllib.parse.urljoin(self._url, to_str(urllib.parse.quote(chunk_name + extension)))
 
     @contextlib.contextmanager
     def request(self, method, url, chunk_name='', ignored_errors=(), timeout=(), **kwargs):
@@ -524,9 +523,14 @@ class S3ChunkStore(ChunkStore):
                 # Turn error responses into the appropriate exception, like raise_for_status
                 status = response.status_code
                 if 400 <= status < 600 and status not in ignored_errors:
+                    # Construct error message, including detailed response content if sensible
                     prefix = 'Chunk {!r}: '.format(chunk_name) if chunk_name else ''
                     msg = '{}Store responded with HTTP error {} ({}) to request: {} {}'.format(
                         prefix, status, response.reason, response.request.method, response.url)
+                    content_type = response.headers.get('Content-Type')
+                    if content_type in ('application/xml', 'text/xml', 'text/plain'):
+                        msg += '\nDetails of server response: {}'.format(response.text)
+                    # Raise the appropriate exception
                     if status == 401:
                         raise AuthorisationFailed(msg)
                     elif status in (403, 404):
@@ -618,11 +622,15 @@ class S3ChunkStore(ChunkStore):
     def create_array(self, array_name):
         """See the docstring of :meth:`ChunkStore.create_array`."""
         # Array name is formatted as bucket/array but we only need to create bucket
-        bucket, _ = self.split(array_name, 1)
-        self._create_bucket(bucket)
+        url = self._chunk_url(array_name, extension='')
+        split_url = urllib.parse.urlsplit(url)
+        # Only keep first path component as this references S3 bucket (may be part of store URL)
+        bucket_name = split_url.path.lstrip('/').split('/')[0]
+        # Note to self: namedtuple._replace is not a private method, despite the underscore!
+        bucket_url = split_url._replace(path=bucket_name).geturl()
+        self._create_bucket(bucket_name, bucket_url)
 
-    def _create_bucket(self, bucket):
-        url = urllib.parse.urljoin(self._url, to_str(urllib.parse.quote(bucket)))
+    def _create_bucket(self, bucket, url):
         # Make bucket (409 indicates the bucket already exists, which is OK)
         self.complete_request('PUT', url, ignored_errors=(409,))
 
@@ -660,56 +668,9 @@ class S3ChunkStore(ChunkStore):
             data = _Multipart([npy_header, memoryview(chunk)])
         self.complete_request('PUT', url, chunk_name, headers=headers, data=data)
 
-    def has_chunk(self, array_name, slices, dtype):
-        """See the docstring of :meth:`ChunkStore.has_chunk`."""
-        dtype = np.dtype(dtype)
-        chunk_name, _ = self.chunk_metadata(array_name, slices, dtype=dtype)
-        url = self._chunk_url(chunk_name)
-        try:
-            self.complete_request('HEAD', url, chunk_name)
-        except ChunkNotFound:
-            return False
-        else:
-            return True
-
-    list_max_keys = 100000
-
-    def list_chunk_ids(self, array_name):
-        """See the docstring of :meth:`ChunkStore.list_chunk_ids`."""
-        NS = '{http://s3.amazonaws.com/doc/2006-03-01/}'
-        bucket, prefix = self.split(array_name, 1)
-        url = urllib.parse.urljoin(self._url, to_str(urllib.parse.quote(bucket)))
-        params = {
-            'prefix': prefix,
-            'max-keys': self.list_max_keys
-        }
-
-        def _read_xml(response):
-            return defusedxml.cElementTree.fromstring(response.content)
-
-        keys = []
-        more = True
-        while more:
-            root = self.complete_request('GET', url, process=_read_xml, params=params)
-            keys.extend(child.text for child in root.iter(NS + 'Key'))
-            truncated = root.find(NS + 'IsTruncated')
-            more = (truncated is not None and truncated.text == 'true')
-            if more:
-                next_marker = root.find(NS + 'NextMarker')
-                if next_marker:
-                    params['marker'] = next_marker.text
-                elif keys:
-                    params['marker'] = keys[-1]
-                else:
-                    warnings.warn('Result had no keys but was marked as truncated')
-                    more = False
-        # Strip the array name and .npy extension to get the chunk ID string
-        return [key[len(prefix) + 1:-4] for key in keys if key.endswith('.npy')]
-
     def mark_complete(self, array_name):
         """See the docstring of :meth:`ChunkStore.mark_complete`."""
-        bucket = self.split(array_name, 1)[0]
-        self._create_bucket(bucket)
+        self.create_array(array_name)
         obj_name = self.join(array_name, 'complete')
         url = urllib.parse.urljoin(self._url, obj_name)
         self.complete_request('PUT', url, obj_name, data=b'')
@@ -726,7 +687,5 @@ class S3ChunkStore(ChunkStore):
 
     get_chunk.__doc__ = ChunkStore.get_chunk.__doc__
     put_chunk.__doc__ = ChunkStore.put_chunk.__doc__
-    has_chunk.__doc__ = ChunkStore.has_chunk.__doc__
-    list_chunk_ids.__doc__ = ChunkStore.list_chunk_ids.__doc__
     mark_complete.__doc__ = ChunkStore.mark_complete.__doc__
     is_complete.__doc__ = ChunkStore.is_complete.__doc__
