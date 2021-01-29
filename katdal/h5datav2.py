@@ -28,7 +28,7 @@ from .dataset import (DataSet, WrongVersion, BrokenFile, Subarray,
                       DEFAULT_SENSOR_PROPS, DEFAULT_VIRTUAL_SENSORS,
                       _robust_target, _selection_to_list)
 from .spectral_window import SpectralWindow
-from .sensordata import RecordSensorData, SensorCache, to_str
+from .sensordata import RecordSensorGetter, SensorCache, to_str
 from .categorical import CategoricalData, sensor_to_categorical
 from .lazy_indexer import LazyIndexer, LazyTransform
 from .flags import NAMES as FLAG_NAMES, DESCRIPTIONS as FLAG_DESCRIPTIONS
@@ -128,7 +128,7 @@ def dummy_dataset(name, shape, dtype, value):
     # It is important to randomise the filename as h5py does not allow two writable file objects with the same name
     # Without this randomness katdal can only open one file requiring a dummy dataset
     random_string = ''.join(['%02x' % (x,) for x in np.random.randint(256, size=8)])
-    dummy_file = h5py.File('%s_%s.h5' % (name, random_string), driver='core', backing_store=False)
+    dummy_file = h5py.File('%s_%s.h5' % (name, random_string), 'x', driver='core', backing_store=False)
     return dummy_file.create_dataset(name, shape=shape, maxshape=shape,
                                      dtype=dtype, fillvalue=value, compression='gzip')
 
@@ -265,7 +265,7 @@ class H5DataV2(DataSet):
                obj.dtype.names == ('timestamp', 'value', 'status'):
                 # Rename pedestal sensors from the old regime to become sensors of the corresponding antenna
                 name = ('Antennas/ant' + name[13:]) if name.startswith('Pedestals/ped') else name
-                cache[name] = RecordSensorData(obj, name)
+                cache[name] = RecordSensorGetter(obj, name)
         sensors_group.visititems(register_sensor)
         # Use estimated data timestamps for now, to speed up data segmentation
         self.sensor = SensorCache(cache, data_timestamps, self.dump_period, keep=self._time_keep,
