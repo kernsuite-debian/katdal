@@ -1,3 +1,11 @@
+katdal (0.17-1kern1) focal; urgency=medium
+
+  [ Athanaseus Javas Ramaila ]
+  * New upstream version 0.17
+  * Build for focal
+
+ -- KERN packaging <packaging@kernsuite.info>  Fri, 29 Jan 2021 13:17:50 +0000
+
 katdal (0.15-1kern1) bionic; urgency=medium
 
   [ Athanaseus Javas Ramaila ]
