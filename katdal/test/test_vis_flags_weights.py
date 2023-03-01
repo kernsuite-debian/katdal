@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2018-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2018-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,26 +15,25 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.vis_flags_weights`."""
-from __future__ import print_function, division, absolute_import
-from builtins import object
 
-import tempfile
-import shutil
+import itertools
 import os
 import random
-import itertools
+import shutil
+import tempfile
 
-import numpy as np
-from numpy.testing import assert_array_equal
-from nose.tools import assert_equal, assert_raises
 import dask.array as da
+import numpy as np
+from nose.tools import assert_equal, assert_raises
+from numpy.testing import assert_array_equal
 
 from katdal.chunkstore import generate_chunks
 from katdal.chunkstore_npy import NpyFileChunkStore
-from katdal.vis_flags_weights import (VisFlagsWeights, ChunkStoreVisFlagsWeights,
-                                      corrprod_to_autocorr)
-from katdal.van_vleck import autocorr_lookup_table
 from katdal.flags import DATA_LOST
+from katdal.van_vleck import autocorr_lookup_table
+from katdal.lazy_indexer import DaskLazyIndexer
+from katdal.vis_flags_weights import (ChunkStoreVisFlagsWeights,
+                                      VisFlagsWeights, corrprod_to_autocorr)
 
 
 def test_vis_flags_weights():
@@ -91,7 +90,7 @@ def put_fake_dataset(store, prefix, shape, chunk_overrides=None, array_overrides
     return data, chunk_info
 
 
-class TestChunkStoreVisFlagsWeights(object):
+class TestChunkStoreVisFlagsWeights:
     """Test the :class:`ChunkStoreVisFlagsWeights` dataset store."""
 
     @classmethod
@@ -102,25 +101,62 @@ class TestChunkStoreVisFlagsWeights(object):
     def teardown_class(cls):
         shutil.rmtree(cls.tempdir)
 
-    def test_construction(self):
-        # Put fake dataset into chunk store
+    def _make_basic_dataset(self):
         store = NpyFileChunkStore(self.tempdir)
         prefix = 'cb1'
         shape = (10, 64, 30)
         data, chunk_info = put_fake_dataset(store, prefix, shape)
-        vfw = ChunkStoreVisFlagsWeights(store, chunk_info)
         weights = data['weights'] * data['weights_channel'][..., np.newaxis]
+        return store, chunk_info, data, weights
+
+    def test_construction(self):
+        # Put fake dataset into chunk store
+        store, chunk_info, data, weights = self._make_basic_dataset()
         # Check that data is as expected when accessed via VisFlagsWeights
+        vfw = ChunkStoreVisFlagsWeights(store, chunk_info)
         assert_equal(vfw.shape, data['correlator_data'].shape)
         assert_array_equal(vfw.vis.compute(), data['correlator_data'])
         assert_array_equal(vfw.flags.compute(), data['flags'])
         assert_array_equal(vfw.weights.compute(), weights)
         assert_equal(vfw.unscaled_weights, None)
 
+    def test_index(self):
+        # Put fake dataset into chunk store
+        store, chunk_info, data, weights = self._make_basic_dataset()
+        index = np.s_[2:5, -20:]
+        vfw = ChunkStoreVisFlagsWeights(store, chunk_info, index=index)
+        assert_array_equal(vfw.vis.compute(), data['correlator_data'][index])
+        assert_array_equal(vfw.flags.compute(), data['flags'][index])
+        assert_array_equal(vfw.weights.compute(), weights[index])
+
+    def test_lazy_indexer_interaction(self):
+        # Put fake dataset into chunk store
+        store, chunk_info, data, weights = self._make_basic_dataset()
+        vfw = ChunkStoreVisFlagsWeights(store, chunk_info)
+        # Check that the combination of DaskLazyIndexer and VisFlagsWeights works
+        vis_indexer = DaskLazyIndexer(vfw.vis)
+        flags_indexer = DaskLazyIndexer(vfw.flags)
+        weights_indexer = DaskLazyIndexer(vfw.weights)
+        assert_array_equal(vis_indexer[:], data['correlator_data'])
+        assert_array_equal(flags_indexer[:], data['flags'])
+        assert_array_equal(weights_indexer[:], weights)
+        # Probe the case where we select a small portion of the data, which
+        # has a different code path and also represents what mvftoms does.
+        assert_array_equal(vis_indexer[0], data['correlator_data'][0])
+        assert_array_equal(flags_indexer[0], data['flags'][0])
+        assert_array_equal(weights_indexer[0], weights[0])
+        # Also check fancy indexing to complete the set
+        dumps = np.ones(vfw.shape[0], dtype=bool)
+        dumps[2:5] = False
+        dumps[8:] = False
+        assert_array_equal(vis_indexer[dumps], data['correlator_data'][dumps])
+        assert_array_equal(flags_indexer[dumps], data['flags'][dumps])
+        assert_array_equal(weights_indexer[dumps], weights[dumps])
+
     def test_van_vleck(self):
         ants = 7
         index1, index2 = np.triu_indices(ants)
-        inputs = ['m{:03}h'.format(i) for i in range(ants)]
+        inputs = [f'm{i:03}h' for i in range(ants)]
         corrprods = np.array([(inputs[a], inputs[b]) for (a, b) in zip(index1, index2)])
         auto_indices, _, _ = corrprod_to_autocorr(corrprods)
         # Put fake dataset into chunk store
@@ -148,7 +184,7 @@ class TestChunkStoreVisFlagsWeights(object):
     def test_weight_power_scale(self):
         ants = 7
         index1, index2 = np.triu_indices(ants)
-        inputs = ['m{:03}h'.format(i) for i in range(ants)]
+        inputs = [f'm{i:03}h' for i in range(ants)]
         corrprods = np.array([(inputs[a], inputs[b]) for (a, b) in zip(index1, index2)])
         # Put fake dataset into chunk store
         store = NpyFileChunkStore(self.tempdir)

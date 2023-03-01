@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -19,25 +19,22 @@
 # Ludwig Schwardt
 # 25 March 2008
 #
-from __future__ import print_function, division, absolute_import
-from builtins import range
 
 import os
 import os.path
 from copy import deepcopy
 
-import numpy as np
-from pkg_resources import parse_version
 import casacore
+import numpy as np
 from casacore import tables
+from pkg_resources import parse_version
 
 # Perform python-casacore version checks
 pyc_ver = parse_version(casacore.__version__)
 req_ver = parse_version("2.2.1")
 if not pyc_ver >= req_ver:
-    raise ImportError("python-casacore %s is required, but the current version is %s. "
-                      "Note that python-casacore %s requires at least casacore 2.3.0."
-                      % (req_ver, pyc_ver, req_ver))
+    raise ImportError(f"python-casacore {req_ver} is required, but the current version is {pyc_ver}. "
+                      f"Note that python-casacore {req_ver} requires at least casacore 2.3.0.")
 
 
 def open_table(name, readonly=False, verbose=False, **kwargs):
@@ -88,9 +85,8 @@ def tiled_array(comment, valueType, ndim, dataManagerGroup, **kwargs):
 
 def define_hypercolumn(desc):
     """Add hypercolumn definitions to table description."""
-    desc['_define_hypercolumn_'] = dict([(v['dataManagerGroup'],
-                                          dict(HCdatanames=[k], HCndim=v['ndim'] + 1))
-                                         for k, v in desc.items() if v['dataManagerType'] == 'TiledShapeStMan'])
+    desc['_define_hypercolumn_'] = {v['dataManagerGroup']: dict(HCdatanames=[k], HCndim=v['ndim'] + 1)
+                                    for k, v in desc.items() if v['dataManagerType'] == 'TiledShapeStMan'}
 
 
 # Map MeasurementSet string types to numpy types
@@ -218,6 +214,15 @@ def kat_ms_desc_and_dminfo(nbl, nchan, ncorr, model_data=False):
     shape = [nchan, ncorr]
     desc = tables.tablecreatearraycoldesc(
         "WEIGHT_SPECTRUM", 1.0, comment="Per-channel weights",
+        options=4, valuetype='float', shape=shape, ndim=len(shape),
+        datamanagergroup=dm_group, datamanagertype='TiledColumnStMan')
+    dmgroup_spec[dm_group] = dmspec(desc["desc"])
+    additional_columns.append(desc)
+
+    dm_group = 'SigmaSpectrum'
+    shape = [nchan, ncorr]
+    desc = tables.tablecreatearraycoldesc(
+        "SIGMA_SPECTRUM", 1.0, comment="Per-channel inverse sqrt weights",
         options=4, valuetype='float', shape=shape, ndim=len(shape),
         datamanagergroup=dm_group, datamanagertype='TiledColumnStMan')
     dmgroup_spec[dm_group] = dmspec(desc["desc"])
@@ -376,6 +381,13 @@ def populate_main_dict(uvw_coordinates, vis_data, flag_data, weight_data, timest
     main_dict['FLAG_ROW'] = np.zeros(num_vis_samples, dtype=np.uint8)
     # The visibility weights
     main_dict['WEIGHT_SPECTRUM'] = weight_data
+    # Estimated RMS noise per frequency channel
+    # note this column is used when computing calibration weights
+    # in CASA - WEIGHT_SPECTRUM may be modified based on the
+    # values in this column. See
+    # https://casadocs.readthedocs.io/en/stable/notebooks/data_weights.html
+    # for further details
+    main_dict['SIGMA_SPECTRUM'] = weight_data ** -0.5
     # Weight set by imaging task (e.g. uniform weighting) (float, 1-dim)
     # main_dict['IMAGING_WEIGHT'] = np.ones((num_vis_samples, 1), dtype=np.float32)
     # The sampling interval (double)
@@ -390,7 +402,8 @@ def populate_main_dict(uvw_coordinates, vis_data, flag_data, weight_data, timest
     # Sequential scan number from on-line system (integer)
     main_dict['SCAN_NUMBER'] = scan_number
     # Estimated rms noise for channel with unity bandpass response (float, 1-dim)
-    main_dict['SIGMA'] = np.ones((num_vis_samples, num_pols), dtype=np.float32)
+    # See also comment for SIGMA_SPECTRUM for further details
+    main_dict['SIGMA'] = np.mean(weight_data, axis=1) ** -0.5
     # ID for this observing state (integer)
     main_dict['STATE_ID'] = state_id
     # Modified Julian Dates in seconds (double)
@@ -399,9 +412,8 @@ def populate_main_dict(uvw_coordinates, vis_data, flag_data, weight_data, timest
     main_dict['TIME_CENTROID'] = timestamps
     # Vector with uvw coordinates (in metres) (double, 1-dim, shape=(3,))
     main_dict['UVW'] = np.asarray(uvw_coordinates)
-    # Weight for each polarisation spectrum (float, 1-dim). This is just
-    # just filled with 1's, because the real weights are in WEIGHT_SPECTRUM.
-    main_dict['WEIGHT'] = np.ones((num_vis_samples, num_pols), dtype=np.float32)
+    # Weight for each polarisation spectrum (float, 1-dim)
+    main_dict['WEIGHT'] = np.mean(weight_data, axis=1)
     return main_dict
 
 
@@ -592,7 +604,7 @@ def populate_polarization_dict(ms_pols=['HH', 'VV'], stokes_i=False, circular=Fa
                  'HH': 9, 'VV': 12, 'HV': 10, 'VH': 11}
     if len(ms_pols) > 1 and stokes_i:
         print("Warning: Polarisation to be marked as stokes, but more than 1 polarisation "
-              "product specified. Using first specified pol (%s)" % ms_pols[0])
+              f"product specified. Using first specified pol ({ms_pols[0]})")
         ms_pols = [ms_pols[0]]
     #  Indices describing receptors of feed going into correlation (integer, 2-dim)
     polarization_dict = {}
@@ -744,7 +756,7 @@ def populate_source_dict(phase_centers, time_origins, field_names=None):
     phase_centers = np.atleast_2d(np.asarray(phase_centers, np.float64))
     num_fields = len(phase_centers)
     if field_names is None:
-        field_names = ['Source%d' % (field,) for field in range(num_fields)]
+        field_names = [f'Source{field}' for field in range(num_fields)]
     source_dict = {}
     # Source identifier as specified in the FIELD sub-table (integer)
     source_dict['SOURCE_ID'] = np.arange(num_fields, dtype=np.int32)
@@ -793,7 +805,7 @@ def populate_field_dict(phase_centers, time_origins, field_names=None):
     phase_centers = np.atleast_2d(np.asarray(phase_centers, np.float64))[:, np.newaxis, :]
     num_fields = len(phase_centers)
     if field_names is None:
-        field_names = ['Field%d' % (field,) for field in range(num_fields)]
+        field_names = [f'Field{field}' for field in range(num_fields)]
     field_dict = {}
     # Special characteristics of field, e.g. position code (string)
     field_dict['CODE'] = np.tile('T', num_fields)
@@ -867,7 +879,7 @@ def populate_pointing_dict(num_antennas, observation_duration, start_time, phase
     start_time : float
         Start time of observation, as a Modified Julian Date in seconds
     phase_center : array of float, shape (2,)
-        Direction of phase center, in ra-dec coordinates as 2-element array
+        Direction of phase center, in (az, el) coordinates as 2-element array (?)
     pointing_name : string, optional
         Name for pointing
 
@@ -972,23 +984,26 @@ def populate_ms_dict(uvw_coordinates, vis_data, timestamps, antenna1_index, ante
 # ----------------- Write completed dictionary to MS file --------------------
 
 
-def write_rows(t, row_dict, verbose=True):
+def write_rows(t, row_dict, verbose=True, start_row=-1):
+    existing_rows = t.nrows()
     num_rows = list(row_dict.values())[0].shape[0]
-    # Append rows to the table by starting after the last row in table
-    startrow = t.nrows()
+    # By default, append rows to the table by starting after the last row
+    if start_row < 0:
+        start_row = existing_rows
     # Add the space required for this group of rows
-    t.addrows(num_rows)
+    new_rows = max(start_row + num_rows - existing_rows, 0)
+    t.addrows(new_rows)
     if verbose:
-        print("  added %d rows" % (num_rows,))
+        print(f"  added {new_rows} rows")
     for col_name, col_data in row_dict.items():
         if col_name not in t.colnames():
             if verbose:
-                print("  column '%s' not in table" % (col_name,))
+                print(f"  column '{col_name}' not in table")
             continue
         if col_data.dtype.kind == 'U':
             col_data = np.char.encode(col_data, encoding='utf-8')
         try:
-            t.putcol(col_name, col_data, startrow)
+            t.putcol(col_name, col_data, start_row)
         except RuntimeError as err:
             print("  error writing column '%s' with shape %s (%s)" %
                   (col_name, col_data.shape, err))
@@ -996,6 +1011,7 @@ def write_rows(t, row_dict, verbose=True):
             if verbose:
                 print("  wrote column '%s' with shape %s" %
                       (col_name, col_data.shape))
+    return num_rows
 
 
 def write_dict(ms_dict, ms_name, verbose=True):
@@ -1007,7 +1023,7 @@ def write_dict(ms_dict, ms_name, verbose=True):
         # Iterate through row groups that are separate dicts within the sub_dict array
         for row_dict in sub_dict:
             if verbose:
-                print("Table %s:" % (sub_table_name,))
+                print(f"Table {sub_table_name}:")
             # Open main table or sub-table
             if sub_table_name == 'MAIN':
                 t = open_table(ms_name, verbose=verbose)
@@ -1015,7 +1031,7 @@ def write_dict(ms_dict, ms_name, verbose=True):
                 t = open_table('::'.join((ms_name, sub_table_name)))
             if verbose:
                 print("  opened successfully")
-            write_rows(t, row_dict, verbose)
+            write_rows(t, row_dict, verbose, start_row=0)
             t.close()
             if verbose:
                 print("  closed successfully")

@@ -1,7 +1,5 @@
-# -*- coding: utf-8
-
 ################################################################################
-# Copyright (c) 2018-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2018-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -17,17 +15,17 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.sensordata`."""
-from __future__ import print_function, division, absolute_import
-from builtins import object
 
 from collections import OrderedDict
+from unittest import mock
 
 import numpy as np
-from nose.tools import assert_equal, assert_in, assert_not_in, assert_raises, assert_is_instance
-import mock
+from nose.tools import (assert_equal, assert_in, assert_is_instance,
+                        assert_not_in, assert_raises)
 
-from katdal.sensordata import (SensorCache, SensorData, SimpleSensorGetter, to_str,
-                               remove_duplicates_and_invalid_values)
+from katdal.sensordata import (SensorCache, SensorData, SimpleSensorGetter,
+                               remove_duplicates_and_invalid_values,
+                               telstate_decode, to_str)
 
 
 def assert_equal_typed(a, b):
@@ -35,47 +33,62 @@ def assert_equal_typed(a, b):
     assert_equal(type(a), type(b))
 
 
-class TestToStr(object):
+class TestToStr:
     def test_non_str(self):
         assert_equal_typed(to_str(3), 3)
         assert_equal_typed(to_str(None), None)
 
     def test_simple_str(self):
         assert_equal_typed(to_str(b'hello'), 'hello')
-        assert_equal_typed(to_str(u'hello'), 'hello')
+        assert_equal_typed(to_str('hello'), 'hello')
 
     def test_non_ascii(self):
         assert_equal_typed(to_str(b'caf\xc3\xa9'), 'café')
-        assert_equal_typed(to_str(u'café'), 'café')
+        assert_equal_typed(to_str('café'), 'café')
 
     def test_list(self):
-        assert_equal_typed(to_str([b'hello', u'world']), ['hello', 'world'])
+        assert_equal_typed(to_str([b'hello', 'world']), ['hello', 'world'])
 
     def test_tuple(self):
-        assert_equal_typed(to_str((b'hello', u'world')), ('hello', 'world'))
+        assert_equal_typed(to_str((b'hello', 'world')), ('hello', 'world'))
 
     def test_dict(self):
-        assert_equal_typed(to_str({b'hello': b'world', u'abc': u'xyz'}),
+        assert_equal_typed(to_str({b'hello': b'world', 'abc': 'xyz'}),
                            {'hello': 'world', 'abc': 'xyz'})
 
     def test_custom_dict(self):
-        assert_equal_typed(to_str(OrderedDict([(b'hello', b'world'), (u'abc', u'xyz')])),
+        assert_equal_typed(to_str(OrderedDict([(b'hello', b'world'), ('abc', 'xyz')])),
                            OrderedDict([('hello', 'world'), ('abc', 'xyz')]))
 
     def test_numpy_str(self):
         a = np.array([[b'abc', b'def'], [b'ghi', b'jk']])
-        b = np.array([[u'abc', u'def'], [u'ghi', u'jk']])
+        b = np.array([['abc', 'def'], ['ghi', 'jk']])
         c = np.array([['abc', 'def'], ['ghi', 'jk']])
         np.testing.assert_array_equal(to_str(a), c)
         np.testing.assert_array_equal(to_str(b), c)
 
     def test_numpy_object(self):
-        a = np.array([b'abc', u'def', (b'xyz', u'uvw')], dtype='O')
+        a = np.array([b'abc', 'def', (b'xyz', 'uvw')], dtype='O')
         b = np.array(['abc', 'def', ('xyz', 'uvw')], dtype='O')
         np.testing.assert_array_equal(to_str(a), b)
 
 
-class TestSensorCache(object):
+@mock.patch('katsdptelstate.encoding._allow_pickle', True)
+@mock.patch('katsdptelstate.encoding._warn_on_pickle', False)
+def test_telstate_decode():
+    raw = "S'1'\n."
+    assert telstate_decode(raw) == '1'
+    assert telstate_decode(raw.encode()) == '1'
+    assert telstate_decode(np.void(raw.encode())) == '1'
+    assert telstate_decode('l', no_decode=('l', 's', 'u', 'x')) == 'l'
+    raw_np = ("cnumpy.core.multiarray\nscalar\np1\n(cnumpy\ndtype\np2\n(S'f8'\nI0\nI1\ntRp3\n"
+              "(I3\nS'<'\nNNNI-1\nI-1\nI0\ntbS'8\\xdf\\xd4(\\x89\\xfc\\xef?'\ntRp4\n.")
+    value_np = telstate_decode(raw_np)
+    assert value_np == 0.9995771214953271
+    assert isinstance(value_np, np.float64)
+
+
+class TestSensorCache:
     def _cache_data(self):
         sensors = [
             ('foo', [4.0, 7.0], [3.0, 6.0]),

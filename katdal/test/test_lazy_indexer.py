@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,25 +15,24 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.lazy_indexer`."""
-from __future__ import print_function, division, absolute_import
-from builtins import object, range
 
-from numbers import Integral
 from functools import partial
+from numbers import Integral
 
-import numpy as np
 import dask.array as da
-from nose.tools import assert_raises, assert_equal
+import numpy as np
+from nose.tools import assert_equal, assert_raises
 
-from katdal.lazy_indexer import (_range_to_slice, _simplify_index,
-                                 _dask_oindex, dask_getitem, DaskLazyIndexer)
-
-
-def slice_to_range(s, l):
-    return range(*s.indices(l))
+from katdal.lazy_indexer import (DaskLazyIndexer, _dask_oindex,
+                                 _range_to_slice, _simplify_index,
+                                 dask_getitem)
 
 
-class TestRangeToSlice(object):
+def slice_to_range(s, length):
+    return range(*s.indices(length))
+
+
+class TestRangeToSlice:
     """Test the :func:`~katdal.lazy_indexer._range_to_slice` function."""
     @staticmethod
     def _check_slice(start, stop, step):
@@ -65,7 +64,7 @@ class TestRangeToSlice(object):
             _range_to_slice([1, 1, 2, 3, 5, 8, 13])
 
 
-class TestSimplifyIndex(object):
+class TestSimplifyIndex:
     """Test the :func:`~katdal.lazy_indexer._simplify_index` function."""
     def setup(self):
         self.shape = (3, 4, 5)
@@ -175,7 +174,7 @@ def numpy_oindex_lite(x, keep):
 UNEVEN = [False, True, True, True, False, False, True, True, False, True]
 
 
-class TestDaskGetitem(object):
+class TestDaskGetitem:
     """Test the :func:`~katdal.lazy_indexer.dask_getitem` function."""
     def setup(self):
         shape = (10, 20, 30, 40)
@@ -245,7 +244,7 @@ class TestDaskGetitem(object):
                         np.s_[0, 2:5, 3 * UNEVEN, np.newaxis, [4, 6]])
 
 
-class TestDaskLazyIndexer(object):
+class TestDaskLazyIndexer:
     """Test the :class:`~katdal.lazy_indexer.DaskLazyIndexer` class."""
     def setup(self):
         shape = (10, 20, 30)
@@ -255,8 +254,8 @@ class TestDaskLazyIndexer(object):
     def test_str_repr(self):
         def transform1(x):
             return x
-        transform2 = lambda x: x    # noqa: E731
-        class Transform3(object):   # noqa: E306
+        transform2 = lambda x: x  # noqa: E731
+        class Transform3:         # noqa: E306
             def __call__(self, x):
                 return x
         transform3 = Transform3()
@@ -264,7 +263,7 @@ class TestDaskLazyIndexer(object):
         transforms = [transform1, transform2, transform3, transform4]
         indexer = DaskLazyIndexer(self.data_dask, transforms=transforms)
         expected = 'x | transform1 | <lambda> | Transform3 | transform1'
-        expected += ' -> {} {}'.format(indexer.shape, indexer.dtype)
+        expected += f' -> {indexer.shape} {indexer.dtype}'
         assert_equal(str(indexer), expected)
         # Simply exercise repr - no need to check result
         repr(indexer)
@@ -274,6 +273,9 @@ class TestDaskLazyIndexer(object):
         npy2 = numpy_oindex(npy1, stage2)
         indexer = DaskLazyIndexer(self.data_dask, stage1)
         np.testing.assert_array_equal(indexer[stage2], npy2)
+        # Check nested indexers
+        indexer2 = DaskLazyIndexer(indexer, stage2)
+        np.testing.assert_array_equal(indexer2[()], npy2)
 
     def test_stage1_slices(self):
         self._test_with(np.s_[5:, :, 1::2])
@@ -302,12 +304,8 @@ class TestDaskLazyIndexer(object):
         # Add transform at initialisation
         indexer = DaskLazyIndexer(self.data_dask, transforms=[lambda x: 0 * x])
         np.testing.assert_array_equal(indexer[:], np.zeros_like(indexer))
-        # Add transform before first use of object
+        # Check nested indexers
         indexer = DaskLazyIndexer(self.data_dask)
-        indexer.add_transform(lambda x: 0 * x)
-        np.testing.assert_array_equal(indexer[:], np.zeros_like(indexer))
-        # Add transform after first use of object
-        indexer = DaskLazyIndexer(self.data_dask)
-        indexer.dataset
-        indexer.add_transform(lambda x: 0 * x)
-        np.testing.assert_array_equal(indexer[:], np.zeros_like(indexer))
+        indexer2 = DaskLazyIndexer(indexer, transforms=[lambda x: 0 * x])
+        np.testing.assert_array_equal(indexer[:], self.data)
+        np.testing.assert_array_equal(indexer2[:], np.zeros_like(indexer))

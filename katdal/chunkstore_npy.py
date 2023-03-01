@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,16 +15,15 @@
 ################################################################################
 
 """A store of chunks (i.e. N-dimensional arrays) based on NPY files."""
-from __future__ import print_function, division, absolute_import
 
-import os
+import contextlib
 import errno
 import mmap
-import contextlib
+import os
 
 import numpy as np
 
-from .chunkstore import (ChunkStore, StoreUnavailable, ChunkNotFound, BadChunk,
+from .chunkstore import (BadChunk, ChunkNotFound, ChunkStore, StoreUnavailable,
                          npy_header_and_body)
 
 
@@ -82,10 +81,9 @@ class NpyFileChunkStore(ChunkStore):
     """
 
     def __init__(self, path, direct_write=False):
-        super(NpyFileChunkStore, self).__init__({IOError: ChunkNotFound,
-                                                 ValueError: ChunkNotFound})
+        super().__init__({IOError: ChunkNotFound, ValueError: ChunkNotFound})
         if not os.path.isdir(path):
-            raise StoreUnavailable('Directory {!r} does not exist'.format(path))
+            raise StoreUnavailable(f'Directory {path!r} does not exist')
         self.path = path
         self.direct_write = direct_write
         if direct_write and not hasattr(os, 'O_DIRECT'):
@@ -98,10 +96,8 @@ class NpyFileChunkStore(ChunkStore):
         with self._standard_errors(chunk_name):
             chunk = np.load(filename, allow_pickle=False)
         if chunk.shape != shape or chunk.dtype != dtype:
-            raise BadChunk('Chunk {!r}: NPY file dtype {} and/or shape {} '
-                           'differs from expected dtype {} and shape {}'
-                           .format(chunk_name, chunk.dtype, chunk.shape,
-                                   dtype, shape))
+            raise BadChunk(f'Chunk {chunk_name!r}: NPY file dtype {chunk.dtype} and/or shape '
+                           f'{chunk.shape} differs from expected dtype {dtype} and shape {shape}')
         return chunk
 
     def create_array(self, array_name):

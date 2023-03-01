@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2018-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2018-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,29 +15,28 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.datasources`."""
-from __future__ import print_function, division, absolute_import
-from builtins import object
 
-import urllib.parse
-import tempfile
-import shutil
 import os
+import shutil
+import tempfile
+import urllib.parse
 
-import numpy as np
-from nose.tools import assert_raises
 import katsdptelstate
+import numpy as np
 from katsdptelstate.rdb_writer import RDBWriter
+from nose.tools import assert_raises
 
 from katdal.chunkstore_npy import NpyFileChunkStore
-from katdal.datasources import (TelstateDataSource, view_l0_capture_stream, open_data_source,
-                                DataSourceNotFound)
+from katdal.datasources import (DataSourceNotFound, TelstateDataSource,
+                                open_data_source, view_l0_capture_stream)
 from katdal.flags import DATA_LOST
-from katdal.vis_flags_weights import correct_autocorr_quantisation
 from katdal.test.test_vis_flags_weights import put_fake_dataset
+from katdal.vis_flags_weights import correct_autocorr_quantisation
 
 
 def _make_fake_stream(telstate, store, cbid, stream, shape,
-                      chunk_overrides=None, array_overrides=None, flags_only=False):
+                      chunk_overrides=None, array_overrides=None, flags_only=False,
+                      bls_ordering_override=None):
     telstate_prefix = telstate.join(cbid, stream)
     store_prefix = telstate_prefix.replace('_', '-')
     data, chunk_info = put_fake_dataset(store, store_prefix, shape,
@@ -48,7 +47,7 @@ def _make_fake_stream(telstate, store, cbid, stream, shape,
     s_view = telstate.view(stream)
     cs_view['chunk_info'] = chunk_info
     cs_view['first_timestamp'] = 123.0
-    s_view['sync_time'] = 123456789.0
+    s_view['sync_time'] = 1600000000.0
     s_view['int_time'] = 2.0
     s_view['bandwidth'] = 856e6
     s_view['center_freq'] = 1284e6
@@ -56,19 +55,21 @@ def _make_fake_stream(telstate, store, cbid, stream, shape,
     s_view['n_bls'] = shape[2]
     # This isn't particularly representative - may need refinement depending on
     # what the test does
-    n_ant = 1
-    while n_ant * (n_ant + 1) * 2 < shape[2]:
-        n_ant += 1
-    if n_ant * (n_ant + 1) * 2 != shape[2]:
-        raise ValueError('n_bls is not consistent with an integer number of antennas')
-    bls_ordering = []
-    for i in range(n_ant):
-        for j in range(i, n_ant):
-            for x in 'hv':
-                for y in 'hv':
-                    bls_ordering.append(('m{:03}{}'.format(i, x),
-                                         'm{:03}{}'.format(j, y)))
-    s_view['bls_ordering'] = np.array(bls_ordering)
+    if bls_ordering_override is None:
+        n_ant = 1
+        while n_ant * (n_ant + 1) * 2 < shape[2]:
+            n_ant += 1
+        if n_ant * (n_ant + 1) * 2 != shape[2]:
+            raise ValueError('n_bls is not consistent with an integer number of antennas')
+        bls_ordering = []
+        for i in range(n_ant):
+            for j in range(i, n_ant):
+                for x in 'hv':
+                    for y in 'hv':
+                        bls_ordering.append((f'm{i:03}{x}', f'm{j:03}{y}'))
+        s_view['bls_ordering'] = np.array(bls_ordering)
+    else:
+        s_view['bls_ordering'] = np.asarray(bls_ordering_override)
     if not flags_only:
         s_view['need_weights_power_scale'] = True
         s_view['stream_type'] = 'sdp.vis'
@@ -78,8 +79,9 @@ def _make_fake_stream(telstate, store, cbid, stream, shape,
 
 
 def make_fake_data_source(telstate, store, l0_shape, cbid='cb', l1_flags_shape=None,
-                         l0_chunk_overrides=None, l1_flags_chunk_overrides=None,
-                         l0_array_overrides=None, l1_flags_array_overrides=None):
+                          l0_chunk_overrides=None, l1_flags_chunk_overrides=None,
+                          l0_array_overrides=None, l1_flags_array_overrides=None,
+                          bls_ordering_override=None):
     """Create a complete fake data source.
 
     The resulting telstate and chunk store are suitable for constructing
@@ -92,12 +94,14 @@ def make_fake_data_source(telstate, store, l0_shape, cbid='cb', l1_flags_shape=N
     l0_data, l0_cs_view, l0_s_view = \
         _make_fake_stream(telstate, store, cbid, 'sdp_l0', l0_shape,
                           chunk_overrides=l0_chunk_overrides,
-                          array_overrides=l0_array_overrides)
+                          array_overrides=l0_array_overrides,
+                          bls_ordering_override=bls_ordering_override)
     l1_flags_data, l1_flags_cs_view, l1_flags_s_view = \
         _make_fake_stream(telstate, store, cbid, 'sdp_l1_flags', l1_flags_shape,
                           chunk_overrides=l1_flags_chunk_overrides,
                           array_overrides=l1_flags_array_overrides,
-                          flags_only=True)
+                          flags_only=True,
+                          bls_ordering_override=bls_ordering_override)
     l1_flags_s_view['src_streams'] = ['sdp_l0']
     telstate['sdp_archived_streams'] = ['sdp_l0', 'sdp_l1_flags']
     return view_l0_capture_stream(telstate, cbid, 'sdp_l0') + (l0_data, l1_flags_data)
@@ -119,7 +123,7 @@ def assert_telstate_data_source_equal(source1, source2):
     np.testing.assert_array_equal(source1.data.weights.compute(), source2.data.weights.compute())
 
 
-class TestTelstateDataSource(object):
+class TestTelstateDataSource:
     def setup(self):
         self.tempdir = tempfile.mkdtemp()
         self.store = NpyFileChunkStore(self.tempdir)
@@ -130,13 +134,42 @@ class TestTelstateDataSource(object):
 
     def test_basic_timestamps(self):
         # Add a sensor to telstate to exercise the relevant code paths in TelstateDataSource
-        self.telstate.add('obs_script_log', 'Digitisers synced', ts=123456789.)
+        self.telstate.add('obs_script_log', 'Digitisers synced', ts=1600000000.)
         view, cbid, sn, _, _ = make_fake_data_source(self.telstate, self.store, (20, 64, 40))
-        data_source = TelstateDataSource(view, cbid, sn, chunk_store=None, source_name='hello')
-        assert 'hello' in data_source.name
+        data_source = TelstateDataSource(
+            view, cbid, sn, chunk_store=None, url='http://hello')
         assert data_source.data is None
-        expected_timestamps = np.arange(20, dtype=np.float32) * 2 + 123456789 + 123
+        expected_timestamps = np.arange(20, dtype=np.float32) * 2 + 1600000123
         np.testing.assert_array_equal(data_source.timestamps, expected_timestamps)
+
+    def test_timestamps_preselect(self):
+        view, cbid, sn, l0_data, l1_flags_data = \
+            make_fake_data_source(self.telstate, self.store, (20, 64, 40))
+        data_source = TelstateDataSource(view, cbid, sn, self.store,
+                                         preselect=dict(dumps=np.s_[2:10]))
+        np.testing.assert_array_equal(
+            data_source.timestamps,
+            np.arange(2, 10, dtype=np.float32) * 2 + 1600000123)
+
+    def test_bad_preselect(self):
+        view, cbid, sn, l0_data, l1_flags_data = \
+            make_fake_data_source(self.telstate, self.store, (20, 64, 40))
+        with assert_raises(IndexError):
+            TelstateDataSource(view, cbid, sn, self.store, preselect=dict(dumps=np.s_[[1, 2]]))
+        with assert_raises(IndexError):
+            TelstateDataSource(view, cbid, sn, self.store, preselect=dict(dumps=np.s_[5:0:-1]))
+        with assert_raises(IndexError):
+            TelstateDataSource(view, cbid, sn, self.store, preselect=dict(frequencies=np.s_[:]))
+
+    def test_preselect(self):
+        view, cbid, sn, l0_data, l1_flags_data = \
+            make_fake_data_source(self.telstate, self.store, (20, 64, 40))
+        preselect = dict(dumps=np.s_[2:10], channels=np.s_[-20:])
+        index = np.s_[2:10, -20:]
+        data_source = TelstateDataSource(view, cbid, sn, self.store,
+                                         upgrade_flags=False, preselect=preselect)
+        np.testing.assert_array_equal(data_source.data.vis.compute(), l0_data['correlator_data'][index])
+        np.testing.assert_array_equal(data_source.data.flags.compute(), l0_data['flags'][index])
 
     def test_upgrade_flags(self):
         shape = (20, 16, 40)
@@ -159,7 +192,7 @@ class TestTelstateDataSource(object):
             l0_chunk_overrides=l0_chunk_overrides,
             l1_flags_chunk_overrides=l1_flags_chunk_overrides)
         data_source = TelstateDataSource(view, cbid, sn, self.store)
-        expected_timestamps = np.arange(l0_shape[0], dtype=np.float32) * 2 + 123456789 + 123
+        expected_timestamps = np.arange(l0_shape[0], dtype=np.float32) * 2 + 1600000123
         np.testing.assert_array_equal(data_source.timestamps, expected_timestamps)
         np.testing.assert_array_equal(data_source.data.vis.compute(), l0_data['correlator_data'])
         expected_flags = np.zeros(l0_shape, np.uint8)
@@ -188,7 +221,7 @@ class TestTelstateDataSource(object):
             l0_chunk_overrides=l0_chunk_overrides,
             l1_flags_chunk_overrides=l1_flags_chunk_overrides)
         data_source = TelstateDataSource(view, cbid, sn, self.store)
-        expected_timestamps = np.arange(l1_flags_shape[0], dtype=np.float32) * 2 + 123456789 + 123
+        expected_timestamps = np.arange(l1_flags_shape[0], dtype=np.float32) * 2 + 1600000123
         np.testing.assert_array_equal(data_source.timestamps, expected_timestamps)
         expected_vis = np.zeros(l1_flags_shape, l0_data['correlator_data'].dtype)
         expected_vis[:18] = l0_data['correlator_data']
@@ -215,7 +248,7 @@ class TestTelstateDataSource(object):
         l0_shape = (18, 16, 40)
         l1_flags_shape = (20, 8, 40)
         view, cbid, sn, _, _ = make_fake_data_source(self.telstate, self.store, l0_shape,
-                                                    l1_flags_shape=l1_flags_shape)
+                                                     l1_flags_shape=l1_flags_shape)
         with assert_raises(ValueError):
             TelstateDataSource(view, cbid, sn, self.store)
 
@@ -241,7 +274,7 @@ class TestTelstateDataSource(object):
         # Save RDB file to e.g. 'tempdir/cb/cb_sdp_l0.rdb', as if 'tempdir' is a real S3 bucket
         rdb_dir = os.path.join(self.tempdir, cbid)
         os.mkdir(rdb_dir)
-        rdb_filename = os.path.join(rdb_dir, '{}_{}.rdb'.format(cbid, sn))
+        rdb_filename = os.path.join(rdb_dir, f'{cbid}_{sn}.rdb')
         # Insert CBID and stream name at the top level, just like metawriter does
         self.telstate['capture_block_id'] = cbid
         self.telstate['stream_name'] = sn
@@ -260,3 +293,6 @@ class TestTelstateDataSource(object):
             open_data_source('ftp://unsupported')
         with assert_raises(DataSourceNotFound):
             open_data_source(rdb_filename[:-4])
+        source_name = f'{cbid}_{sn}'
+        assert source_from_file.name == source_name
+        assert rdb_filename in source_from_file.url

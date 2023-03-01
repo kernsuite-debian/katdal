@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,16 +15,16 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.chunkstore_npy`."""
-from __future__ import print_function, division, absolute_import
 
-import tempfile
+import os
 import shutil
+import tempfile
 
 from nose import SkipTest
 from nose.tools import assert_raises
 
-from katdal.chunkstore_npy import NpyFileChunkStore
 from katdal.chunkstore import StoreUnavailable
+from katdal.chunkstore_npy import NpyFileChunkStore
 from katdal.test.test_chunkstore import ChunkStoreTestBase
 
 
@@ -40,6 +40,12 @@ class TestNpyFileChunkStore(ChunkStoreTestBase):
     @classmethod
     def teardown_class(cls):
         shutil.rmtree(cls.tempdir)
+
+    def setup(self):
+        # Clean out data created by previous tests
+        for entry in os.scandir(self.tempdir):
+            if not entry.name.startswith('.') and entry.is_dir():
+                shutil.rmtree(entry.path)
 
     def test_store_unavailable(self):
         assert_raises(StoreUnavailable, NpyFileChunkStore, 'hahahahahaha')

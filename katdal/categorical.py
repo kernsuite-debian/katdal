@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,8 +15,6 @@
 ################################################################################
 
 """Container for categorical (i.e. non-numerical) sensor data and related tools."""
-from __future__ import print_function, division, absolute_import
-from builtins import zip, range, object
 
 import collections
 
@@ -24,7 +22,7 @@ import numpy as np
 from dask.base import tokenize
 
 
-class ComparableArrayWrapper(object):
+class ComparableArrayWrapper:
     """Wrapper that improves comparison of array objects.
 
     This wrapper class has two main benefits:
@@ -52,8 +50,8 @@ class ComparableArrayWrapper(object):
 
     def __repr__(self):
         """Short human-friendly string representation of wrapper object."""
-        return "<katdal.%s { %r } at 0x%x>" % \
-               (self.__class__.__name__, self.unwrapped, id(self))
+        class_name = self.__class__.__name__
+        return f"<katdal.{class_name} {{ {self.unwrapped!r} }} at {id(self):#x}>"
 
     def __str__(self):
         """Longer human-friendly string representation of wrapped object."""
@@ -208,7 +206,7 @@ def unique_in_order(elements, return_inverse=False):
 # -------------------------------------------------------------------------------------------------
 
 
-class CategoricalData(object):
+class CategoricalData:
     """Container for categorical (i.e. non-numerical) sensor data.
 
     This container allows simple manipulation and interpolation of a time series
@@ -338,8 +336,8 @@ class CategoricalData(object):
 
     def __repr__(self):
         """Short human-friendly string representation of categorical data object."""
-        return "<katdal.CategoricalData events=%d values=%d type=%s at 0x%x>" % \
-               (len(self.indices), len(self.unique_values), self.dtype, id(self))
+        return "<katdal.CategoricalData events={} values={} type={} at {:#x}>".format(
+               len(self.indices), len(self.unique_values), self.dtype, id(self))
 
     def __str__(self):
         """Long human-friendly string representation of categorical data object."""

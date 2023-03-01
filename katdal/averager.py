@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -14,11 +14,8 @@
 # limitations under the License.
 ################################################################################
 
-from __future__ import print_function, division, absolute_import
-from builtins import range
-
-import numpy as np
 import numba
+import numpy as np
 
 
 @numba.jit(nopython=True, parallel=True)

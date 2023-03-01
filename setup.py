@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,12 +16,9 @@
 # limitations under the License.
 ################################################################################
 
-from __future__ import print_function, division, absolute_import
-
 import os.path
 
-from setuptools import setup, find_packages
-
+from setuptools import find_packages, setup
 
 here = os.path.dirname(__file__)
 readme = open(os.path.join(here, 'README.rst')).read()
@@ -53,16 +50,15 @@ setup(name='katdal',
           'Topic :: Scientific/Engineering :: Astronomy'],
       platforms=['OS Independent'],
       keywords='meerkat ska',
-      python_requires='>=3.5',
+      python_requires='>=3.6',
       setup_requires=['katversion'],
       use_katversion=True,
-      install_requires=['numpy >= 1.12.0', 'katpoint >= 0.9', 'h5py >= 2.3', 'numba',
-                        'katsdptelstate[rdb] >= 0.10', 'dask[array] >= 1.2.1',
-                        'requests >= 2.18.0', 'pyjwt < 2', 'future',
-                        'cityhash >= 0.2.2'],
+      install_requires=['numpy >= 1.12.0', 'katpoint >= 0.9, < 1', 'h5py >= 2.3',
+                        'numba', 'katsdptelstate[rdb] >= 0.10', 'dask[array] >= 2.7.0',
+                        'requests >= 2.18.0', 'pyjwt >= 2', 'cityhash >= 0.2.2'],
       extras_require={
           'ms': ['python-casacore >= 2.2.1'],
           's3': [],
           's3credentials': ['botocore']
       },
-      tests_require=['mock', 'nose', 'subprocess32'])
+      tests_require=['nose'])

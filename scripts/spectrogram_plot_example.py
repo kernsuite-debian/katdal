@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -24,19 +24,16 @@
 # 26 June 2012
 #
 
-from __future__ import print_function, division, absolute_import
-
-from builtins import range
-from builtins import object
 import optparse
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+
 import katdal
 
 
-class ResampledImage(object):
+class ResampledImage:
     """Image that only loads enough data that will fit onto screen pixels.
 
     Parameters
@@ -135,5 +132,5 @@ else:
                         autoscale=opts.autoscale, ax=ax)
     ax.set_xlabel('Channel index')
     ax.set_ylabel('Dump index')
-    ax.set_title('Spectrogram %s %s %s' % (d.name, ant, opts.pol))
+    ax.set_title(f'Spectrogram {d.name} {ant} {opts.pol}')
     plt.show()

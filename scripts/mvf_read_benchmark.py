@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-from __future__ import print_function, division, absolute_import
-from builtins import range
 import argparse
 import logging
 import time
@@ -11,7 +9,6 @@ import numpy as np
 
 import katdal
 from katdal.lazy_indexer import DaskLazyIndexer
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('filename')

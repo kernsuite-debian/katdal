@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2018-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2018-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -24,21 +24,19 @@ This is largely an implementation detail of the mvftoms.py script, and might
 not be suited to other use cases. It is put into a separate module as a
 workaround for https://bugs.python.org/issue9914.
 """
-from __future__ import print_function, division, absolute_import
-from builtins import object
 
-from collections import namedtuple
 import contextlib
 import multiprocessing
 import multiprocessing.sharedctypes
+from collections import namedtuple
 
-import numpy as np
 import katpoint
+import numpy as np
 
 from . import ms_extra
 
 
-class RawArray(object):
+class RawArray:
     """Shared memory array, in representation that can be passed through multiprocessing queue"""
     def __init__(self, shape, dtype):
         self.shape = shape
@@ -59,7 +57,7 @@ EndOfScan = namedtuple('EndOfScan', [])
 
 def ms_writer_process(
         work_queue, result_queue, options, antennas, cp_info, ms_name,
-        raw_vis_data, raw_weight_data, raw_flag_data):
+        raw_vis_data, raw_weight_data, raw_flag_data, start_row):
     """
     Function to be run in a separate process for writing to a Measurement Set.
     The MS is assumed to have already been created with the appropriate
@@ -97,6 +95,8 @@ def ms_writer_process(
     raw_vis_data, raw_weight_data, raw_flag_data : :class:`RawArray`
         Circular buffers for the data, with shape
         (slots, time, baseline, channel, pol).
+    start_row : int
+        Row in Measurement Set where output will start
     """
 
     none_seen = False
@@ -179,7 +179,9 @@ def ms_writer_process(
                         big_scan_itr, model_data, corrected_data)
 
                     # Write data to MS.
-                    ms_extra.write_rows(main_table, main_dict, verbose=options.verbose)
+                    nrows = ms_extra.write_rows(main_table, main_dict,
+                                                options.verbose, start_row)
+                    start_row += nrows
 
                     # Calculate bytes written from the summed arrays in the dict
                     scan_size += sum(a.nbytes for a in main_dict.values()

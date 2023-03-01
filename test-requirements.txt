@@ -1,4 +1,4 @@
+-c https://raw.githubusercontent.com/ska-sa/katsdpdockerbase/master/docker-base-build/base-requirements.txt
+
 coverage
-mock==4.0.2
 nose
-subprocess32==3.5.4
