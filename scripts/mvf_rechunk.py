@@ -2,34 +2,30 @@
 
 """Rechunk an existing MVF dataset"""
 
-from __future__ import print_function, division, absolute_import
-from future import standard_library
-standard_library.install_aliases()  # noqa: 402
-from builtins import object
-
-import sys
-import os
-import re
 import argparse
 import multiprocessing
+import os
+import re
+import sys
 import urllib.parse
 
-from katsdptelstate.rdb_writer import RDBWriter
-import numpy as np
 import dask
 import dask.array as da
+import numpy as np
+from katsdptelstate.rdb_writer import RDBWriter
 
 from katdal.chunkstore import ChunkStoreError
 from katdal.chunkstore_npy import NpyFileChunkStore
-from katdal.datasources import TelstateDataSource, view_capture_stream, infer_chunk_store
+from katdal.datasources import (TelstateDataSource, infer_chunk_store,
+                                view_capture_stream)
 from katdal.flags import DATA_LOST
 
 
-class RechunkSpec(object):
+class RechunkSpec:
     def __init__(self, arg):
         match = re.match(r'^([A-Za-z0-9_.]+)/([A-Za-z0-9_]+):(\d+),(\d+)', arg)
         if not match:
-            raise ValueError('Could not parse {!r}'.format(arg))
+            raise ValueError(f'Could not parse {arg!r}')
         self.stream = match.group(1)
         self.array = match.group(2)
         self.time = int(match.group(3))
@@ -54,7 +50,7 @@ def _make_lost(data, block_info):
         return np.zeros(info['chunk-shape'], np.uint8)
 
 
-class Array(object):
+class Array:
     def __init__(self, stream_name, array_name, store, chunk_info):
         self.stream_name = stream_name
         self.array_name = array_name
@@ -92,7 +88,7 @@ def parse_args():
         'a new chunking scheme may be specified. A chunking scheme is '
         'specified as the number of dumps and channels per chunk.')
     parser.add_argument('--workers', type=int, default=8*multiprocessing.cpu_count(),
-                        help='Number of dask workers I/O [%(default)s]')
+                        help='Number of dask workers for parallel I/O [%(default)s]')
     parser.add_argument('--streams', type=comma_list, metavar='STREAM,STREAM',
                         help='Streams to copy [all]')
     parser.add_argument('--s3-endpoint-url', help='URL where rechunked data will be uploaded')
@@ -154,14 +150,14 @@ def main():
         try:
             chunk_info = sts['chunk_info']
         except KeyError as exc:
-            raise RuntimeError('Could not get chunk info for {!r}: {}'.format(stream_name, exc))
+            raise RuntimeError(f'Could not get chunk info for {stream_name!r}: {exc}')
         for array_name, array_info in chunk_info.items():
             if args.new_prefix is not None:
                 array_info['prefix'] = args.new_prefix + '-' + stream_name.replace('_', '-')
             prefix = array_info['prefix']
             path = os.path.join(args.dest, prefix)
             if os.path.exists(path):
-                raise RuntimeError('Directory {!r} already exists'.format(path))
+                raise RuntimeError(f'Directory {path!r} already exists')
             store = get_chunk_store(args.source, sts, array_name)
             # Older files have dtype as an object that can't be encoded in msgpack
             dtype = np.dtype(array_info['dtype'])
@@ -200,7 +196,7 @@ def main():
     for spec in args.spec:
         key = (spec.stream, spec.array)
         if key not in arrays:
-            raise RuntimeError('{}/{} is not a known array'.format(spec.stream, spec.array))
+            raise RuntimeError(f'{spec.stream}/{spec.array} is not a known array')
         arrays[key].data = arrays[key].data.rechunk({0: spec.time, 1: spec.freq})
 
     # Write out the new data

@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,29 +15,25 @@
 ################################################################################
 
 """A (lazy) container for the triplet of visibilities, flags and weights."""
-from __future__ import print_function, division, absolute_import
-from future import standard_library
-standard_library.install_aliases()  # noqa: 402
-from builtins import zip, object
 
 import itertools
 import logging
 
-import numpy as np
 import dask.array as da
+import numba
+import numpy as np
+import toolz
 from dask.array.rechunk import intersect_chunks
 from dask.highlevelgraph import HighLevelGraph
-import toolz
-import numba
 
+from .chunkstore import PlaceholderChunk
 from .flags import DATA_LOST
 from .van_vleck import autocorr_lookup_table
-
 
 logger = logging.getLogger(__name__)
 
 
-class VisFlagsWeights(object):
+class VisFlagsWeights:
     """Correlator data in the form of visibilities, flags and weights.
 
     This container stores the triplet of visibilities, flags and weights
@@ -58,27 +54,26 @@ class VisFlagsWeights(object):
         Identifier that describes the origin of the data (backend-specific)
     """
 
-    def __init__(self, vis, flags, weights, unscaled_weights=None, name='custom'):
+    def __init__(self, vis, flags, weights, unscaled_weights=None):
         if not (vis.shape == flags.shape == weights.shape):
-            raise ValueError("Shapes of vis %s, flags %s and weights %s differ"
-                             % (vis.shape, flags.shape, weights.shape))
+            raise ValueError(f'Shapes of vis {vis.shape}, flags {flags.shape} '
+                             f'and weights {weights.shape} differ')
         if unscaled_weights is not None and (unscaled_weights.shape != vis.shape):
-            raise ValueError("Shapes of unscaled weights %s and vis %s differ"
-                             % (unscaled_weights.shape, vis.shape))
+            raise ValueError(f'Shapes of unscaled weights {unscaled_weights.shape} '
+                             f'and vis {vis.shape} differ')
         self.vis = vis
         self.flags = flags
         self.weights = weights
         self.unscaled_weights = unscaled_weights
-        self.name = name
 
     @property
     def shape(self):
         return self.vis.shape
 
 
-def _default_zero(array, shape, dtype):
-    if array is None:
-        return np.zeros(shape, dtype)
+def _default_zero(array):
+    if isinstance(array, PlaceholderChunk):
+        return np.zeros(array.shape, array.dtype)
     else:
         return array
 
@@ -88,7 +83,7 @@ def _apply_data_lost(orig_flags, lost):
         return orig_flags
     flags = orig_flags
     for chunk, slices in toolz.partition(2, lost):
-        if chunk is None:
+        if isinstance(chunk, PlaceholderChunk):
             if flags is orig_flags:
                 flags = orig_flags.copy()
             flags[slices] |= DATA_LOST
@@ -280,6 +275,10 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
         Should be True if `corrprods` is `None`.
     van_vleck : {'off', 'autocorr'}, optional
         Type of Van Vleck (quantisation) correction to perform
+    index : tuple of slice, optional
+        Slice expression to apply to each array before combining them. At the
+        moment this can only have two elements (no slicing of baselines),
+        because ``weights_channel`` only has time and frequency dimensions.
 
     Attributes
     ----------
@@ -288,15 +287,15 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
     """
 
     def __init__(self, store, chunk_info, corrprods=None,
-                 stored_weights_are_scaled=True, van_vleck='off'):
+                 stored_weights_are_scaled=True, van_vleck='off', index=()):
         self.store = store
         self.vis_prefix = chunk_info['correlator_data']['prefix']
         darray = {}
         for array, info in chunk_info.items():
             array_name = store.join(info['prefix'], array)
             chunk_args = (array_name, info['chunks'], info['dtype'])
-            errors = DATA_LOST if array == 'flags' else 'none'
-            darray[array] = store.get_dask_array(*chunk_args, errors=errors)
+            errors = DATA_LOST if array == 'flags' else 'placeholder'
+            darray[array] = store.get_dask_array(*chunk_args, index=index, errors=errors)
         flags_orig_name = darray['flags'].name
         flags_raw_name = store.join(chunk_info['flags']['prefix'], 'flags_raw')
         # Combine original flags with data_lost indicating where values were lost from
@@ -352,9 +351,7 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
             dsk = {
                 (new_name,) + index: (
                     _default_zero,
-                    (array.name,) + index,
-                    shape,
-                    array.dtype
+                    (array.name,) + index
                 ) for index, shape in zip(indices, itertools.product(*array.chunks))
             }
             dsk = HighLevelGraph.from_collections(new_name, dsk, dependencies=[array])
@@ -369,7 +366,7 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
             vis = correct_autocorr_quantisation(vis, corrprods)
         elif van_vleck != 'off':
             raise ValueError("The van_vleck parameter should be one of ['off', 'autocorr'], "
-                             "got '{}' instead".format(van_vleck))
+                             f"got '{van_vleck}' instead")
 
         # Combine low-resolution weights and high-resolution weights_channel
         stored_weights = darray['weights'] * darray['weights_channel'][..., np.newaxis]
@@ -387,4 +384,4 @@ class ChunkStoreVisFlagsWeights(VisFlagsWeights):
             weights = stored_weights
             # Don't bother with unscaled weights (it's optional)
             unscaled_weights = None
-        VisFlagsWeights.__init__(self, vis, flags, weights, unscaled_weights, self.vis_prefix)
+        VisFlagsWeights.__init__(self, vis, flags, weights, unscaled_weights)

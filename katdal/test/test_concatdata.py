@@ -1,7 +1,5 @@
-# -*- coding: utf-8
-
 ################################################################################
-# Copyright (c) 2020, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2020-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -17,18 +15,16 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.concatdata`."""
-from __future__ import print_function, division, absolute_import
-from builtins import object
 
 import numpy as np
 from nose.tools import assert_equal, assert_in, assert_not_in, assert_raises
 
 from katdal.categorical import CategoricalData
-from katdal.sensordata import SensorCache, SimpleSensorGetter
 from katdal.concatdata import ConcatenatedSensorCache
+from katdal.sensordata import SensorCache, SimpleSensorGetter
 
 
-class TestConcatenatedSensorCache(object):
+class TestConcatenatedSensorCache:
     @staticmethod
     def _make_cache(timestamps, sensors):
         cache_data = {}

@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,20 +15,19 @@
 ################################################################################
 
 """Tests for :py:mod:`katdal.chunkstore`."""
-from __future__ import print_function, division, absolute_import
-from builtins import object
 
-import numpy as np
-from numpy.testing import assert_array_equal
-from nose.tools import (assert_raises, assert_equal, assert_true, assert_false,
-                        assert_is_instance, assert_is_none)
 import dask.array as da
+import numpy as np
+from nose.tools import (assert_equal, assert_false, assert_is_instance,
+                        assert_raises, assert_true)
+from numpy.testing import assert_array_equal
 
-from katdal.chunkstore import (ChunkStore, generate_chunks,
-                               StoreUnavailable, ChunkNotFound, BadChunk)
+from katdal.chunkstore import (BadChunk, ChunkNotFound, ChunkStore,
+                               PlaceholderChunk, StoreUnavailable,
+                               generate_chunks, _prune_chunks)
 
 
-class TestGenerateChunks(object):
+class TestGenerateChunks:
     """Test the `generate_chunks` function."""
     def __init__(self):
         self.shape = (10, 8192, 144)
@@ -92,7 +91,22 @@ class TestGenerateChunks(object):
         assert_equal(chunks, ((10,), 1024 * (8,), (144,)))
 
 
-class TestChunkStore(object):
+def test_prune_chunks():
+    """Test the `_prune_chunks` internal function."""
+    chunks = ((10, 10, 10, 10), (2, 2, 2), (40,))
+    # The chunk start-stop boundaries on each axis are:
+    # ((0, 10, 20, 30, 40), (0, 2, 4, 6), (0, 40))
+    index = np.s_[13:34, :4, 10:]
+    new_chunks, new_index, new_offset = _prune_chunks(chunks, index)
+    # The new chunk start-stop boundaries on each axis are:
+    # ((10, 20, 30, 40), (0, 2, 4), (0, 40))
+    assert_equal(new_chunks, ((10, 10, 10), (2, 2), (40,)))
+    assert_equal(new_index, np.s_[3:24, 0:4, 10:40])
+    assert_equal(new_offset, (10, 0, 0))
+    assert_raises(IndexError, _prune_chunks, chunks, np.s_[13:34:2, ::-1, :])
+
+
+class TestChunkStore:
     """This tests the base class functionality."""
 
     def test_put_get(self):
@@ -103,11 +117,11 @@ class TestChunkStore(object):
     def test_metadata_validation(self):
         store = ChunkStore()
         # Bad slice specifications
-        assert_raises(BadChunk, store.chunk_metadata, "x", 3)
-        assert_raises(BadChunk, store.chunk_metadata, "x", [3, 2])
-        assert_raises(BadChunk, store.chunk_metadata, "x", slice(10))
-        assert_raises(BadChunk, store.chunk_metadata, "x", [slice(10)])
-        assert_raises(BadChunk, store.chunk_metadata, "x", [slice(0, 10, 2)])
+        assert_raises(TypeError, store.chunk_metadata, "x", 3)
+        assert_raises(TypeError, store.chunk_metadata, "x", [3, 2])
+        assert_raises(TypeError, store.chunk_metadata, "x", slice(10))
+        assert_raises(TypeError, store.chunk_metadata, "x", [slice(10)])
+        assert_raises(TypeError, store.chunk_metadata, "x", [slice(0, 10, 2)])
         # Chunk mismatch
         assert_raises(BadChunk, store.chunk_metadata, "x", [slice(0, 10, 1)],
                       chunk=np.ones(11))
@@ -130,7 +144,7 @@ class TestChunkStore(object):
                 {}['ha']
 
 
-class ChunkStoreTestBase(object):
+class ChunkStoreTestBase:
     """Standard tests performed on all types of ChunkStore."""
 
     # Instance of store instantiated once per class via class-level fixture
@@ -155,8 +169,7 @@ class ChunkStoreTestBase(object):
         self.store.create_array(array_name)
         self.store.put_chunk(array_name, slices, chunk)
         chunk_retrieved = self.store.get_chunk(array_name, slices, chunk.dtype)
-        assert_array_equal(chunk_retrieved, chunk,
-                           "Error storing {}[{}]".format(var_name, slices))
+        assert_array_equal(chunk_retrieved, chunk, f"Error storing {var_name}[{slices}]")
 
     def make_dask_array(self, var_name, slices=()):
         """Turn (part of) an existing ndarray into a dask array."""
@@ -185,8 +198,7 @@ class ChunkStoreTestBase(object):
         array_retrieved = pull.compute()
         array = dask_array.compute()
         assert_array_equal(array_retrieved, array,
-                           "Error retrieving {} / {} / {}"
-                           .format(array_name, offset, dask_array.chunks))
+                           f'Error retrieving {array_name} / {offset} / {dask_array.chunks}')
 
     def test_chunk_non_existent(self):
         array_name = self.array_name('haha')
@@ -200,7 +212,10 @@ class ChunkStoreTestBase(object):
         assert_equal(zeros.dtype, dtype)
         ones = self.store.get_chunk_or_default(*args, default_value=1)
         assert_array_equal(ones, np.ones(shape, dtype))
-        assert_is_none(self.store.get_chunk_or_none(*args))
+        placeholder = self.store.get_chunk_or_placeholder(*args)
+        assert_is_instance(placeholder, PlaceholderChunk)
+        assert_equal(placeholder.shape, shape)
+        assert_equal(placeholder.dtype, dtype)
 
     def test_chunk_bool_1dim_and_too_small(self):
         # Check basic put + get on 1-D bool
@@ -227,7 +242,7 @@ class ChunkStoreTestBase(object):
     def test_put_chunk_noraise(self):
         name = self.array_name('x')
         self.store.create_array(name)
-        result = self.store.put_chunk_noraise(name, (1, 2), [])
+        result = self.store.put_chunk_noraise(name, (slice(1, 2),), np.ones(4))
         assert_is_instance(result, BadChunk)
 
     def test_dask_array_basic(self):
@@ -235,12 +250,23 @@ class ChunkStoreTestBase(object):
         self.get_dask_array('big_y')
         self.get_dask_array('big_y', np.s_[0:3, 0:30, 0:2])
 
+    @staticmethod
+    def _placeholder_to_default(array, default):
+        """Replace :class:`PlaceholderChunk`s in a dask array with a default value."""
+        def map_blocks_func(chunk):
+            if isinstance(chunk, PlaceholderChunk):
+                return np.full(chunk.shape, default, chunk.dtype)
+            else:
+                return chunk
+
+        return da.map_blocks(map_blocks_func, array, dtype=array.dtype)
+
     def test_dask_array_put_parts_get_whole(self):
         # Split big array into quarters along existing chunks and reassemble
         self.put_dask_array('big_y2', np.s_[0:3,  0:30, 0:2])
         self.put_dask_array('big_y2', np.s_[3:8,  0:30, 0:2])
         self.put_dask_array('big_y2', np.s_[0:3, 30:60, 0:2])
-        # Before storing last quarter, check that get() replaces it with default
+        # Before storing last quarter, check missing chunk handling
         if not self.preloaded_chunks:
             array_name, dask_array, offset = self.make_dask_array('big_y2')
             pull = self.store.get_dask_array(array_name, dask_array.chunks,
@@ -249,11 +275,59 @@ class ChunkStoreTestBase(object):
             assert_equal(array_retrieved.shape, dask_array.shape)
             assert_equal(array_retrieved.dtype, dask_array.dtype)
             assert_array_equal(array_retrieved[np.s_[3:8, 30:60, 0:2]], 17,
+                               f'Missing chunk in {array_name} not replaced by default value')
+
+            pull = self.store.get_dask_array(array_name, dask_array.chunks,
+                                             dask_array.dtype, offset, errors='raise')
+            with assert_raises(ChunkNotFound):
+                pull.compute()
+
+            pull = self.store.get_dask_array(array_name, dask_array.chunks,
+                                             dask_array.dtype, offset, errors='placeholder')
+            # We can't compute pull directly, because placeholders aren't
+            # numpy arrays. So we have to remap them.
+            pull = self._placeholder_to_default(pull, 17)
+            array_retrieved = pull.compute()
+            assert_equal(array_retrieved.shape, dask_array.shape)
+            assert_equal(array_retrieved.dtype, dask_array.dtype)
+            assert_array_equal(array_retrieved[np.s_[3:8, 30:60, 0:2]], 17,
                                "Missing chunk in {} not replaced by default value"
                                .format(array_name))
+
         # Now store the last quarter and check that complete array is correct
         self.put_dask_array('big_y2', np.s_[3:8, 30:60, 0:2])
         self.get_dask_array('big_y2')
+
+    def test_get_dask_array_index(self):
+        # Load most but not all of the array, to test error handling
+        self.put_dask_array('big_y2', np.s_[0:3,  0:30, 0:2])
+        self.put_dask_array('big_y2', np.s_[3:8,  0:30, 0:2])
+        self.put_dask_array('big_y2', np.s_[0:3, 30:60, 0:2])
+        array_name, dask_array, offset = self.make_dask_array('big_y2')
+        indices = [
+            (),
+            np.s_[:, :],
+            np.s_[0:8, 0:60, 0:2],
+            np.s_[..., 0:1],
+            np.s_[5:6, 29:31],
+            np.s_[5:5, 31:31]
+        ]   # TODO: use pytest.mark.parametrize when converted to pytest
+
+        expected = self.big_y2.copy()
+        if not self.preloaded_chunks:
+            expected[3:8, 30:60, 0:2] = 17
+        for index in indices:
+            pull = self.store.get_dask_array(array_name, dask_array.chunks,
+                                             dask_array.dtype, offset, index=index, errors=17)
+            array_retrieved = pull.compute()
+            np.testing.assert_array_equal(array_retrieved, expected[index])
+            # Now test placeholders, to ensure that placeholder slicing works
+            pull = self.store.get_dask_array(array_name, dask_array.chunks,
+                                             dask_array.dtype, offset, index=index,
+                                             errors='placeholder')
+            pull = self._placeholder_to_default(pull, 17)
+            array_retrieved = pull.compute()
+            np.testing.assert_array_equal(array_retrieved, expected[index])
 
     def _test_mark_complete(self, name):
         try:

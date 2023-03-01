@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,42 +16,35 @@
 
 """A store of chunks (i.e. N-dimensional arrays) based on the Amazon S3 API."""
 
-from __future__ import print_function, division, absolute_import
-from future import standard_library
-standard_library.install_aliases()  # noqa: E402
-from builtins import object
-import future.utils
-from future.utils import bytes_to_native_str, raise_from
-
+import base64
 import contextlib
+import copy
+import hashlib
+import json
 import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.error
-import hashlib
-import base64
-import copy
-import json
-import time
 
+import jwt
 import numpy as np
 import requests
-import jwt
+
 try:
-    import botocore.credentials
     import botocore.auth
+    import botocore.credentials
 except ImportError:
     botocore = None
-from urllib3.util.retry import Retry
-from urllib3.response import HTTPResponse
 from urllib3.exceptions import MaxRetryError
+from urllib3.response import HTTPResponse
+from urllib3.util.retry import Retry
 
-from .chunkstore import (ChunkStore, StoreUnavailable, ChunkNotFound, BadChunk,
+from .chunkstore import (BadChunk, ChunkNotFound, ChunkStore, StoreUnavailable,
                          npy_header_and_body)
 from .sensordata import to_str
 
-
-# Lifecycle policies unfortunately use XML encoding rather than JSON
+# Lifecycle policies unfortunately use XML encoding rather than JSON.
 # Following path of least resistance we simply .format() this string
 # with the number of days for the expiry (and produced a sanitised
 # ID at the same time).
@@ -90,7 +83,7 @@ class S3ServerGlitch(ChunkNotFound):
     """S3 chunk store responded with an HTTP error deemed to be temporary."""
 
     def __init__(self, msg, status_code):
-        super(S3ServerGlitch, self).__init__(msg)
+        super().__init__(msg)
         self.status_code = status_code
 
 
@@ -98,7 +91,7 @@ class TruncatedRead(ValueError):
     """HTTP request to S3 chunk store responded with fewer bytes than expected."""
 
 
-class _DetectTruncation(object):
+class _DetectTruncation:
     """Raise :exc:`TruncatedRead` if wrapped `readable` runs out of data."""
 
     def __init__(self, readable):
@@ -113,7 +106,7 @@ class _DetectTruncation(object):
         data = self._readable.read(size, *args, **kwargs)
         if data == b'' and size != 0:
             raise TruncatedRead('Error reading from S3 HTTP response: expected '
-                                '{} more byte(s), got EOF'.format(size))
+                                f'{size} more byte(s), got EOF')
         return data
 
 
@@ -137,7 +130,7 @@ def read_array(fp):
     elif version == (2, 0):
         shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(fp)
     else:
-        raise ValueError('Unsupported .npy version {}'.format(version))
+        raise ValueError(f'Unsupported .npy version {version}')
     if dtype.hasobject:
         raise ValueError('Object arrays are not supported')
     count = int(np.product(shape))
@@ -147,8 +140,8 @@ def read_array(fp):
     # isn't expecting a numpy array
     bytes_read = fp.readinto(memoryview(data.view(np.uint8)))
     if bytes_read != data.nbytes:
-        raise TruncatedRead('Error reading from S3 HTTP response: expected {} '
-                            'bytes, got {}'.format(data.nbytes, bytes_read))
+        raise TruncatedRead('Error reading from S3 HTTP response: '
+                            f'expected {data.nbytes} bytes, got {bytes_read}')
     if fortran_order:
         data.shape = shape[::-1]
         data = data.transpose()
@@ -161,7 +154,6 @@ def _read_chunk(response):
     """Efficiently read NumPy array in NPY format from content of HTTP response."""
     data = response.raw
     # Workaround for https://github.com/urllib3/urllib3/issues/1540
-    # On Python 2, http.client.HTTPResponse doesn't implement readinto.
     # We also can't use the workaround if the content is encoded (e.g.
     # gzip compressed) because that's decoded in urllib3, not httplib.
     if ('Content-encoding' not in response.headers
@@ -176,6 +168,15 @@ def _read_chunk(response):
     return chunk
 
 
+def _bucket_url(url):
+    """Turn `url` into associated S3 bucket URL (first path component only)."""
+    split_url = urllib.parse.urlsplit(url)
+    # Only keep first path component as this references S3 bucket (may be part of store URL)
+    bucket_name = split_url.path.lstrip('/').split('/')[0]
+    # Note to self: namedtuple._replace is not a private method, despite the underscore!
+    return split_url._replace(path=bucket_name).geturl()
+
+
 class AuthorisationFailed(StoreUnavailable):
     """Authorisation failed, e.g. due to invalid, malformed or expired token."""
 
@@ -186,8 +187,8 @@ class InvalidToken(AuthorisationFailed):
     def __init__(self, token, message):
         # Shorten token string but keep the ends so user can check for truncation
         if len(token) > 17:
-            token = '{}[...]{}'.format(token[:6], token[-6:])
-        super(InvalidToken, self).__init__("'{}': {}".format(token, message))
+            token = f'{token[:6]}[...]{token[-6:]}'
+        super().__init__(f"'{token}': {message}")
 
 
 def decode_jwt(token):
@@ -221,34 +222,41 @@ def decode_jwt(token):
         raise InvalidToken(token, "Token does not have exactly two dots ('.') "
                                   "as expected of JWS (maybe it's truncated?)")
     # Remove signature to avoid cryptic PyJWT error message ("Invalid crypto padding")
-    token_without_sig = '{}.{}.'.format(encoded_header, encoded_payload)
+    token_without_sig = f'{encoded_header}.{encoded_payload}.'
+    # Extract header without any validation or verification
     try:
         header = jwt.get_unverified_header(token_without_sig)
     except jwt.exceptions.DecodeError as err:
-        raise_from(InvalidToken(token, "Could not decode token - maybe it's truncated "
-                                       "or corrupted? ({})".format(err)), err)
+        raise InvalidToken(token, "Could not decode token - maybe it's truncated "
+                                  f'or corrupted? ({err})') from err
     # Check signature length for typical MeerKAT signature algorithm
     if header.get('alg') == 'ES256':
         len_sig = len(encoded_signature)
         if len_sig != 86:   # 64 bytes when decoded
-            msg = 'Encoded signature has {} bytes instead of 86 - token string ' \
-                  'is too {}'.format(len_sig, 'short' if len_sig < 86 else 'long')
+            msg = f'Encoded signature has {len_sig} bytes instead of 86 - ' \
+                  f"token string is too {'short' if len_sig < 86 else 'long'}"
             raise InvalidToken(token, msg)
-    # Extract token claims and verify everything except signature and audience
-    options = {'verify_signature': False, 'verify_aud': False}
+    # Extract token claims without any validation or verification
     try:
-        claims = jwt.decode(token, options=options)
+        claims = jwt.decode(token, options={'verify_signature': False})
     except jwt.exceptions.DecodeError as err:
         # This covers e.g. bad characters in the signature or non-JSON-dict payload
-        raise_from(InvalidToken(token, "Could not decode token - maybe it's truncated "
-                                       "or corrupted? ({})".format(err)), err)
-    except jwt.exceptions.ExpiredSignatureError as err:
-        claims = jwt.decode(token, verify=False)
-        exp_time = time.strftime('%d-%b-%Y %H:%M:%S', time.gmtime(claims['exp']))
-        raise_from(InvalidToken(token, 'Token expired at {} UTC, please '
-                                'obtain a new one'.format(exp_time)), err)
+        raise InvalidToken(token, "Could not decode token - maybe it's truncated "
+                                  f'or corrupted? ({err})') from err
     except jwt.exceptions.InvalidTokenError as err:
-        raise_from(InvalidToken(token, str(err)), err)
+        raise InvalidToken(token, str(err)) from err
+    # Check if token has expired (PyJWT>=2 won't do this without signature verification)
+    try:
+        expiration_time = int(claims['exp'])
+        exp_string = time.strftime('%d-%b-%Y %H:%M:%S', time.gmtime(expiration_time))
+    except KeyError:
+        expiration_time = np.inf
+        exp_string = 'inf'
+    except (ValueError, OverflowError) as err:
+        raise InvalidToken(token, 'Expiration time must be an integer that is not too large, '
+                           f"not {claims['exp']!r}") from err
+    if time.time() > expiration_time:
+        raise InvalidToken(token, f'Token expired at {exp_string} UTC, please obtain a new one')
     return claims
 
 
@@ -266,10 +274,10 @@ class _BearerAuth(requests.auth.AuthBase):
         path = urllib.parse.urlparse(r.url).path.lstrip('/')
         valid_prefixes = self._claims['prefix']
         if not any(path.startswith(prefix) for prefix in valid_prefixes):
-            allowed = ', '.join("'{}*'".format(prefix) for prefix in valid_prefixes)
-            raise InvalidToken(self._token, "Token does not grant access to '{}', "
-                                            'only to {}'.format(path, allowed))
-        r.headers['Authorization'] = 'Bearer ' + self._token
+            allowed = ', '.join(f"'{prefix}*'" for prefix in valid_prefixes)
+            raise InvalidToken(self._token,
+                               f"Token does not grant access to '{path}', only to {allowed}")
+        r.headers['Authorization'] = f'Bearer {self._token}'
         return r
 
 
@@ -284,10 +292,10 @@ class _AWSAuth(requests.auth.AuthBase):
         self._signer = botocore.auth.HmacV1Auth(credentials)
 
     def __call__(self, r):
+        access_key = self._signer.credentials.access_key
         split = urllib.parse.urlsplit(r.url)
         signature = self._signer.get_signature(r.method, split, r.headers)
-        r.headers['Authorization'] = 'AWS {}:{}'.format(
-            self._signer.credentials.access_key, signature)
+        r.headers['Authorization'] = f'AWS {access_key}:{signature}'
         return r
 
 
@@ -324,9 +332,8 @@ class _CacheSettingsSession(requests.Session):
     """
 
     def __init__(self, url):
-        super(_CacheSettingsSession, self).__init__()
-        self._cached_settings = super(_CacheSettingsSession, self).merge_environment_settings(
-            url, {}, True, None, None)
+        super().__init__()
+        self._cached_settings = super().merge_environment_settings(url, {}, True, None, None)
 
     def merge_environment_settings(self, url, proxies, stream, verify, cert):
         # Only cache for a specific combination of input settings (the
@@ -334,16 +341,14 @@ class _CacheSettingsSession(requests.Session):
         # variants.
         if (proxies, stream, verify, cert) == ({}, True, None, None):
             if self._cached_settings is None:
-                self._cached_settings = \
-                    super(_CacheSettingsSession, self).merge_environment_settings(
-                        url, proxies, stream, verify, cert)
+                self._cached_settings = super().merge_environment_settings(
+                    url, proxies, stream, verify, cert)
             return self._cached_settings
         else:
-            return super(_CacheSettingsSession, self).merge_environment_settings(
-                url, proxies, stream, verify, cert)
+            return super().merge_environment_settings(url, proxies, stream, verify, cert)
 
 
-class _Pool(object):
+class _Pool:
     """Thread-safe pool of objects constructed by a factory as needed."""
     def __init__(self, factory):
         self._factory = factory
@@ -371,7 +376,7 @@ class _Pool(object):
         self.put(item)
 
 
-class _Multipart(object):
+class _Multipart:
     """Allow a sequence of bytes-like objects to be used as a request body.
 
     This is intended to allow a zero-copy upload of bytes-like objects that
@@ -445,7 +450,7 @@ class S3ChunkStore(ChunkStore):
     def __init__(self, url, timeout=(30, 300), retries=2, token=None,
                  credentials=None, public_read=False, expiry_days=0, **kwargs):
         error_map = {requests.exceptions.RequestException: StoreUnavailable}
-        super(S3ChunkStore, self).__init__(error_map)
+        super().__init__(error_map)
         auth = _auth_factory(url, token, credentials)
         if not isinstance(retries, Retry):
             try:
@@ -471,6 +476,7 @@ class S3ChunkStore(ChunkStore):
         self._session_pool = _Pool(session_factory)
         self._url = to_str(url)
         self._retries = retries
+        self._verified_buckets = set()
         self.timeout = timeout
         self.public_read = public_read
         self.expiry_days = int(expiry_days)
@@ -524,18 +530,16 @@ class S3ChunkStore(ChunkStore):
                 status = response.status_code
                 if 400 <= status < 600 and status not in ignored_errors:
                     # Construct error message, including detailed response content if sensible
-                    prefix = 'Chunk {!r}: '.format(chunk_name) if chunk_name else ''
-                    msg = '{}Store responded with HTTP error {} ({}) to request: {} {}'.format(
-                        prefix, status, response.reason, response.request.method, response.url)
+                    prefix = f'Chunk {chunk_name!r}: ' if chunk_name else ''
+                    msg = (f'{prefix}Store responded with HTTP error {status} ({response.reason}) '
+                           f'to request: {response.request.method} {response.url}')
                     content_type = response.headers.get('Content-Type')
                     if content_type in ('application/xml', 'text/xml', 'text/plain'):
-                        msg += '\nDetails of server response: {}'.format(response.text)
+                        msg += f'\nDetails of server response: {response.text}'
                     # Raise the appropriate exception
-                    if status == 401:
+                    if status in (401, 403):
                         raise AuthorisationFailed(msg)
-                    elif status in (403, 404):
-                        # Ceph RGW returns 403 for missing keys due to our bucket policy
-                        # (see https://tracker.ceph.com/issues/38638 for discussion)
+                    elif status == 404:
                         raise S3ObjectNotFound(msg)
                     elif self._retries.is_retry(method, status):
                         raise S3ServerGlitch(msg, status)
@@ -545,10 +549,10 @@ class S3ChunkStore(ChunkStore):
                     yield response
                 except TruncatedRead as trunc_error:
                     # A truncated read is considered a glitch with custom status
-                    prefix = 'Chunk {!r}: '.format(chunk_name) if chunk_name else ''
+                    prefix = f'Chunk {chunk_name!r}: ' if chunk_name else ''
                     glitch_error = S3ServerGlitch(prefix + str(trunc_error),
                                                   _TRUNCATED_HTTP_STATUS_CODE)
-                    raise_from(glitch_error, trunc_error)
+                    raise glitch_error from trunc_error
 
     def complete_request(self, method, url, chunk_name='',
                          process=lambda response: None, **kwargs):
@@ -596,11 +600,30 @@ class S3ChunkStore(ChunkStore):
                     retries = retries.increment(method, url, response)
                 except MaxRetryError:
                     # Raise the final straw that broke the retry camel's back
-                    raise_from(e, None)
+                    raise e from None
                 else:
                     retries.sleep(response)
             else:
                 return result
+
+    def _verify_bucket(self, url, chunk_error=None):
+        """Check that bucket associated with `url` exists and is not empty."""
+        bucket = _bucket_url(url)
+        if bucket in self._verified_buckets:
+            return
+        try:
+            # Speed up the request by only checking that the bucket has at least one key
+            response = self.complete_request('GET', bucket, process=lambda r: r,
+                                             params={'max-keys': 1})
+        except S3ObjectNotFound as err:
+            # There is no point continuing if the bucket is completely missing
+            raise StoreUnavailable(err) from chunk_error
+        assert response.ok, f'Listing {bucket} failed: {response} {response.content}'
+        # An empty bucket response has no Contents elements (no need for full XML parsing)
+        if b'<Contents>' not in response.content:
+            msg = f'S3 bucket {bucket} is empty - your data is not currently accessible'
+            raise StoreUnavailable(msg) from chunk_error
+        self._verified_buckets.add(bucket)
 
     def get_chunk(self, array_name, slices, dtype):
         """See the docstring of :meth:`ChunkStore.get_chunk`."""
@@ -610,36 +633,37 @@ class S3ChunkStore(ChunkStore):
         # Our hacky optimisation to speed up response reading doesn't
         # work with non-identity encodings.
         headers = {'Accept-Encoding': 'identity'}
-        chunk = self.complete_request('GET', url, chunk_name, _read_chunk,
-                                      headers=headers, stream=True)
+        try:
+            chunk = self.complete_request('GET', url, chunk_name, _read_chunk,
+                                          headers=headers, stream=True)
+        except S3ObjectNotFound as err:
+            # If the entire bucket is gone, this becomes StoreUnavailable instead
+            self._verify_bucket(url, err)
+            # If the bucket checks out, treat this as a random missing chunk and reraise
+            raise
         if chunk.shape != shape or chunk.dtype != dtype:
-            raise BadChunk('Chunk {!r}: dtype {} and/or shape {} in store '
-                           'differs from expected dtype {} and shape {}'
-                           .format(chunk_name, chunk.dtype, chunk.shape,
-                                   dtype, shape))
+            raise BadChunk(f'Chunk {chunk_name!r}: dtype {chunk.dtype} and/or shape {chunk.shape} '
+                           f'in store differs from expected dtype {dtype} and shape {shape}')
         return chunk
 
     def create_array(self, array_name):
         """See the docstring of :meth:`ChunkStore.create_array`."""
         # Array name is formatted as bucket/array but we only need to create bucket
-        url = self._chunk_url(array_name, extension='')
-        split_url = urllib.parse.urlsplit(url)
-        # Only keep first path component as this references S3 bucket (may be part of store URL)
-        bucket_name = split_url.path.lstrip('/').split('/')[0]
-        # Note to self: namedtuple._replace is not a private method, despite the underscore!
-        bucket_url = split_url._replace(path=bucket_name).geturl()
-        self._create_bucket(bucket_name, bucket_url)
+        array_url = self._chunk_url(array_name, extension='')
+        bucket_url = _bucket_url(array_url)
+        self._create_bucket(bucket_url)
 
-    def _create_bucket(self, bucket, url):
+    def _create_bucket(self, url):
         # Make bucket (409 indicates the bucket already exists, which is OK)
         self.complete_request('PUT', url, ignored_errors=(409,))
 
         if self.public_read:
             policy_url = urllib.parse.urljoin(url, '?policy')
+            bucket_name = urllib.parse.urlsplit(url).path.lstrip('/')
             policy = copy.deepcopy(_BUCKET_POLICY)
             policy['Statement'][0]['Resource'] = [
-                'arn:aws:s3:::{}/*'.format(bucket),
-                'arn:aws:s3:::{}'.format(bucket)
+                f'arn:aws:s3:::{bucket_name}/*',
+                f'arn:aws:s3:::{bucket_name}'
             ]
             self.complete_request('PUT', policy_url, data=json.dumps(policy))
 
@@ -660,12 +684,8 @@ class S3ChunkStore(ChunkStore):
         md5_gen = hashlib.md5(npy_header)
         md5_gen.update(chunk)
         md5 = base64.b64encode(md5_gen.digest())
-        headers = {'Content-MD5': bytes_to_native_str(md5)}
-        if future.utils.PY2:
-            # Python 2's httplib doesn't support a sequence of byte-likes.
-            data = npy_header + chunk.tobytes()
-        else:
-            data = _Multipart([npy_header, memoryview(chunk)])
+        headers = {'Content-MD5': md5.decode()}
+        data = _Multipart([npy_header, memoryview(chunk)])
         self.complete_request('PUT', url, chunk_name, headers=headers, data=data)
 
     def mark_complete(self, array_name):

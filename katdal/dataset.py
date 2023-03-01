@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,19 +15,16 @@
 ################################################################################
 
 """Base class for accessing a visibility data set."""
-from __future__ import print_function, division, absolute_import
-from builtins import zip, object
-from past.builtins import basestring
 
-import time
 import logging
 import numbers
-
-import numpy as np
+import pathlib
+import time
+import urllib.parse
 
 import katpoint
+import numpy as np
 from katpoint import is_iterable, rad2deg
-
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +41,7 @@ class BrokenFile(Exception):
     """Data set could not be loaded because file is inconsistent or misses critical bits."""
 
 
-class Subarray(object):
+class Subarray:
     """Subarray specification.
 
     A subarray is determined by the specific correlation products produced by the
@@ -72,22 +69,20 @@ class Subarray(object):
                                        for inpA, inpB in corr_products])
         # Extract all inputs (and associated antennas) from corr product list
         self.inputs = sorted(set(np.ravel(self.corr_products)))
-        input_ants = set([inp[:-1] for inp in self.inputs])
+        input_ants = {inp[:-1] for inp in self.inputs}
         # Only keep antennas that are involved in correlation products
         self.ants = [ant for ant in ants if ant.name in input_ants]
 
     def __repr__(self):
         """Short human-friendly string representation of subarray object."""
-        return "<katdal.Subarray antennas=%d inputs=%d corrprods=%d at 0x%x>" % \
-               (len(self.ants), len(self.inputs), len(self.corr_products),
-                id(self))
+        return "<katdal.Subarray antennas={} inputs={} corrprods={} at {:#x}>".format(
+               len(self.ants), len(self.inputs), len(self.corr_products), id(self))
 
     @property
     def _description(self):
         """Complete string representation, used internally for comparisons."""
         ants = '\n'.join(ant.description for ant in self.ants)
-        corrprods = ' '.join('%s,%s' % (inpA, inpB)
-                             for inpA, inpB in self.corr_products)
+        corrprods = ' '.join(f'{inpA},{inpB}' for inpA, inpB in self.corr_products)
         return '\n'.join((ants, corrprods))
 
     def __eq__(self, other):
@@ -109,6 +104,29 @@ class Subarray(object):
         return hash(self._description)
 
 
+def parse_url_or_path(url_or_path):
+    """Parse URL into components, converting path to absolute file URL.
+
+    Parameters
+    ----------
+    url_or_path : string
+        URL, or filesystem path if there is no scheme
+
+    Returns
+    -------
+    url_parts : :class:`urllib.parse.ParseResult`
+        Components of the parsed URL ('file' scheme will have an absolute path)
+    """
+    url_parts = urllib.parse.urlparse(url_or_path)
+    # Assume filesystem path if there is no scheme (unless url is empty string)
+    if not url_parts.scheme and url_parts.path:
+        # A file:// URL expects an absolute path (local paths can't be located)
+        absolute_path = str(pathlib.Path(url_parts.path).absolute())
+        # Note to self: namedtuple._replace is not a private method, despite the underscore!
+        url_parts = url_parts._replace(scheme='file', path=absolute_path)
+    return url_parts
+
+
 def _robust_target(description):
     """Robust build of :class:`katpoint.Target` object from description string."""
     if not description:
@@ -116,7 +134,7 @@ def _robust_target(description):
     try:
         return katpoint.Target(description)
     except ValueError:
-        logger.warning("Invalid target description '%s' - replaced with dummy target" % (description,))
+        logger.warning("Invalid target description '%s' - replaced with dummy target", description)
         return katpoint.Target('Nothing, special')
 
 
@@ -135,7 +153,7 @@ def _selection_to_list(names, **groups):
     list : list of strings / objects
         List of names / objects
     """
-    if isinstance(names, basestring):
+    if isinstance(names, str):
         if not names:
             return []
         elif names in groups:
@@ -146,6 +164,17 @@ def _selection_to_list(names, **groups):
         return list(names)
     else:
         return [names]
+
+
+def _is_deselection(selectors):
+    """If all the selectors have a tilde ~ , then this is treated as a
+     deselect and we are going to invert the selection.
+     TODO: For version 1 release the deselector interface should just have a leading ~
+     """
+    for selector in selectors:
+        if selector[0] != '~':
+            return False
+    return True
 
 
 DEFAULT_SENSOR_PROPS = {
@@ -171,14 +200,14 @@ def _calc_mjd(cache, name):
 
 def _calc_lst(cache, name, ant):
     """Calculate local sidereal time (LST) timestamps using sensor cache contents."""
-    antenna = cache.get('Antennas/%s/antenna' % (ant,))[0]
+    antenna = cache.get(f'Antennas/{ant}/antenna')[0]
     cache[name] = lst = antenna.local_sidereal_time(cache.timestamps[:])
     return lst
 
 
 def _calc_radec(cache, name, ant):
     """Calculate (ra, dec) pointing coordinates using sensor cache contents."""
-    ant_group = 'Antennas/%s/' % (ant,)
+    ant_group = f'Antennas/{ant}/'
     antenna = cache.get(ant_group + 'antenna')[0]
     az = cache.get(ant_group + 'az')
     el = cache.get(ant_group + 'el')
@@ -191,7 +220,7 @@ def _calc_radec(cache, name, ant):
 
 def _calc_parangle(cache, name, ant):
     """Calculate parallactic angle using sensor cache contents."""
-    ant_group = 'Antennas/%s/' % (ant,)
+    ant_group = f'Antennas/{ant}/'
     antenna = cache.get(ant_group + 'antenna')[0]
     az = cache.get(ant_group + 'az')
     el = cache.get(ant_group + 'el')
@@ -203,7 +232,7 @@ def _calc_parangle(cache, name, ant):
 
 def _calc_target_coords(cache, name, ant, projection, coordsys):
     """Calculate target coordinates using sensor cache contents."""
-    ant_group = 'Antennas/%s/' % (ant,)
+    ant_group = f'Antennas/{ant}/'
     antenna = cache.get(ant_group + 'antenna')[0]
     if coordsys == 'radec':
         lon = cache.get(ant_group + 'ra')
@@ -222,14 +251,14 @@ def _calc_target_coords(cache, name, ant, projection, coordsys):
         x[segm], y[segm] = target.sphere_to_plane(lon[segm], lat[segm],
                                                   cache.timestamps[segm],
                                                   antenna, projection, coordsys)
-    cache[ant_group + 'target_x_%s_%s' % (projection, coordsys)] = x
-    cache[ant_group + 'target_y_%s_%s' % (projection, coordsys)] = y
+    cache[ant_group + f'target_x_{projection}_{coordsys}'] = x
+    cache[ant_group + f'target_y_{projection}_{coordsys}'] = y
     return x if name.startswith(ant_group + 'target_x') else y
 
 
 def _calc_uvw_basis(cache, name, ant):
     """Calculate (u,v,w) basis vectors using sensor cache contents."""
-    ant_group = 'Antennas/%s/' % (ant,)
+    ant_group = f'Antennas/{ant}/'
     antenna = cache.get(ant_group + 'antenna')[0]
     u = np.empty((len(cache.timestamps), 3))
     v = np.empty((len(cache.timestamps), 3))
@@ -249,7 +278,7 @@ def _calc_uvw_basis(cache, name, ant):
 def _calc_uvw_per_ant(cache, name, ant):
     """Calculate (u,v,w) coordinates per antenna using sensor cache contents."""
     array_antenna = cache.get('Antennas/array/antenna')[0]
-    antenna = cache.get('Antennas/%s/antenna' % (ant,))[0]
+    antenna = cache.get(f'Antennas/{ant}/antenna')[0]
     basis = cache.get('Antennas/array/basis_' + name[-1])
     # Obtain baseline vector from array reference to specified antenna
     baseline_m = array_antenna.baseline_toward(antenna)
@@ -272,7 +301,7 @@ DEFAULT_VIRTUAL_SENSORS = {
 # -------------------------------------------------------------------------------------------------
 
 
-class DataSet(object):
+class DataSet:
     """Base class for accessing a visibility data set.
 
     This provides a simple interface to a generic file (or files) containing
@@ -290,6 +319,8 @@ class DataSet(object):
         (default is first antenna in use by script)
     time_offset : float, optional
         Offset to add to all correlator timestamps, in seconds
+    url : string, optional
+        Location of data set (either local filename or full URL accepted)
 
     Attributes
     ----------
@@ -363,10 +394,12 @@ class DataSet(object):
 
     """
 
-    def __init__(self, name, ref_ant='', time_offset=0.0):
+    def __init__(self, name, ref_ant='', time_offset=0.0, url=''):
         self.name = name
         self.ref_ant = ref_ant
         self.time_offset = time_offset
+        self.url = parse_url_or_path(url).geturl()
+
         self.version = ''
         self.observer = ''
         self.description = ''
@@ -411,20 +444,23 @@ class DataSet(object):
 
     def __repr__(self):
         """Short human-friendly string representation of data set object."""
-        return "<katdal.%s '%s' shape %s at 0x%x>" % (self.__class__.__name__, self.name, self.shape, id(self))
+        class_name = self.__class__.__name__
+        return f"<katdal.{class_name} '{self.name}' shape {self.shape} at {id(self):#x}>"
 
     def __str__(self):
         """Verbose human-friendly string representation of data set."""
         # Start with static file information
         descr = ['===============================================================================',
-                 'Name: %s (version %s)' % (self.name, self.version),
+                 f'Name: {self.name} (version {self.version})',
+                 '-------------------------------------------------------------------------------',
+                 f'URL: {self.url}',
                  '===============================================================================',
-                 'Observer: %s  Experiment ID: %s' % (self.observer if self.observer else '-',
-                                                      self.experiment_id if self.experiment_id else '-'),
-                 "Description: '%s'" % (self.description if self.description else 'No description',),
-                 'Observed from %s to %s' % (self.start_time.local(), self.end_time.local()),
-                 'Dump rate / period: %.5f Hz / %.3f s' % (1 / self.dump_period, self.dump_period),
-                 'Subarrays: %d' % (len(self.subarrays),),
+                 'Observer: {}  Experiment ID: {}'.format(self.observer if self.observer else '-',
+                                                          self.experiment_id if self.experiment_id else '-'),
+                 "Description: '{}'".format(self.description if self.description else 'No description'),
+                 f'Observed from {self.start_time.local()} to {self.end_time.local()}',
+                 'Dump rate / period: {:.5f} Hz / {:.3f} s'.format(1 / self.dump_period, self.dump_period),
+                 'Subarrays: {}'.format(len(self.subarrays)),
                  '  ID  Antennas                            Inputs  Corrprods']
         for n, sub in enumerate(self.subarrays):
             ant_names = ','.join([ant.name for ant in sub.ants])
@@ -442,7 +478,7 @@ class DataSet(object):
         descr += ['-------------------------------------------------------------------------------',
                   'Data selected according to the following criteria:']
         for k, v in sorted(self._selection.items()):
-            descr.append('  %s=%s' % (k, ("'%s'" % (v,)) if isinstance(v, basestring) else v))
+            descr.append('  {}={}'.format(k, f"'{v}'" if isinstance(v, str) else v))
         descr.append('-------------------------------------------------------------------------------')
         descr.append('Shape: (%d dumps, %d channels, %d correlation products) => Size: %s' %
                      tuple(list(self.shape) + ['%.3f %s' % ((self.size / 1e9, 'GB') if self.size > 1e9 else
@@ -474,7 +510,7 @@ class DataSet(object):
             # Calculate average target flux over selected frequency band
             flux_spectrum = target.flux_density(self.freqs / 1e6)
             flux_valid = ~np.isnan(flux_spectrum)
-            flux = ('%9.2f' % (flux_spectrum[flux_valid].mean(),)) if np.any(flux_valid) else ''
+            flux = '{:9.2f}'.format(flux_spectrum[flux_valid].mean()) if np.any(flux_valid) else ''
             target_dumps = ((self.sensor.get('Observation/target_index') == n) & self._time_keep).sum()
             descr.append('  %2d  %s  %s  %11s  %11s  %s  %5d  %s' %
                          (n, target.name.ljust(name_len), target_type.ljust(8),
@@ -631,7 +667,9 @@ class DataSet(object):
             value via a sequence of string pairs, or select all autocorrelations
             via 'auto' or all cross-correlations via 'cross'.
         ants : string or :class:`katpoint.Antenna` object or sequence, optional
-            Select antennas by name or object
+            Select antennas by name or object. If all antennas specified are
+            prefaced by a ~ this is treated as a deselection and these antennas
+            are excluded.
         inputs : string or sequence of strings, optional
             Select inputs by label
         pol : string or sequence of strings
@@ -732,7 +770,7 @@ class DataSet(object):
                 scans = _selection_to_list(v)
                 scan_keep = np.zeros(len(self._time_keep), dtype=np.bool)
                 scan_sensor = self.sensor.get('Observation/scan_state' if k == 'scans' else 'Observation/label')
-                scan_index_sensor = self.sensor.get('Observation/%s_index' % (k[:-1],))
+                scan_index_sensor = self.sensor.get(f'Observation/{k[:-1]}_index')
                 for scan in scans:
                     if isinstance(scan, numbers.Integral):
                         scan_keep |= (scan_index_sensor == scan)
@@ -749,7 +787,7 @@ class DataSet(object):
                     try:
                         if isinstance(t, numbers.Integral):
                             target_index = t
-                        elif isinstance(t, katpoint.Target) or isinstance(t, basestring) and ',' in t:
+                        elif isinstance(t, katpoint.Target) or isinstance(t, str) and ',' in t:
                             target_index = self.catalogue.targets.index(t)
                         else:
                             target_index = self.catalogue.targets.index(self.catalogue[t])
@@ -795,8 +833,13 @@ class DataSet(object):
             elif k == 'ants':
                 ants = _selection_to_list(v)
                 ant_names = [(ant.name if isinstance(ant, katpoint.Antenna) else ant) for ant in ants]
-                self._corrprod_keep &= [(inpA[:-1] in ant_names and inpB[:-1] in ant_names)
-                                        for inpA, inpB in self.subarrays[self.subarray].corr_products]
+                if _is_deselection(ant_names):
+                    ant_names = [ant_name[1:] for ant_name in ant_names]
+                    self._corrprod_keep &= [(inpA[:-1] not in ant_names and inpB[:-1] not in ant_names)
+                                            for inpA, inpB in self.subarrays[self.subarray].corr_products]
+                else:
+                    self._corrprod_keep &= [(inpA[:-1] in ant_names and inpB[:-1] in ant_names)
+                                            for inpA, inpB in self.subarrays[self.subarray].corr_products]
             elif k == 'inputs':
                 inps = _selection_to_list(v)
                 self._corrprod_keep &= [(inpA in inps and inpB in inps)
@@ -839,7 +882,7 @@ class DataSet(object):
         self.channel_width = self.spectral_windows[self.spw].channel_width
         self.corr_products = self.subarrays[self.subarray].corr_products[self._corrprod_keep]
         self.inputs = sorted(set(np.ravel(self.corr_products)))
-        input_ants = set([inp[:-1] for inp in self.inputs])
+        input_ants = {inp[:-1] for inp in self.inputs}
         self.ants = [ant for ant in self.subarrays[self.subarray].ants if ant.name in input_ants]
         # Ensure that updated selections make their way to sensor cache, as
         # well as any underlying datasets and data lazy indexers that need it
@@ -1033,12 +1076,12 @@ class DataSet(object):
         The sidereal times are returned in an array of float, shape (*T*,).
 
         """
-        return self.sensor['Antennas/%s/lst' % self.ref_ant] * (12 / np.pi)
+        return self.sensor[f'Antennas/{self.ref_ant}/lst'] * (12 / np.pi)
 
     def _sensor_per_ant(self, base_name):
         """Extract a single sensor per antenna and safely stack the results."""
         def sensor_data(ant_name):
-            return self.sensor['Antennas/%s/%s' % (ant_name, base_name)]
+            return self.sensor[f'Antennas/{ant_name}/{base_name}']
         return np.column_stack([sensor_data(ant.name) for ant in self.ants]) \
             if self.ants else np.zeros((self.shape[0], 0))
 
@@ -1050,8 +1093,8 @@ class DataSet(object):
         what (u, v, w) sensors need.
         """
         def difference(antA, antB):
-            coord1 = self.sensor['Antennas/%s/%s' % (antA, base_name)]
-            coord2 = self.sensor['Antennas/%s/%s' % (antB, base_name)]
+            coord1 = self.sensor[f'Antennas/{antA}/{base_name}']
+            coord2 = self.sensor[f'Antennas/{antB}/{base_name}']
             return coord1 - coord2
         return np.column_stack([difference(inpA[:-1], inpB[:-1])
                                 for inpA, inpB in self.corr_products]) \
@@ -1121,7 +1164,7 @@ class DataSet(object):
         float, shape (*T*, *A*).
 
         """
-        name = 'target_x_%s_%s' % (self.target_projection, self.target_coordsys)
+        name = f'target_x_{self.target_projection}_{self.target_coordsys}'
         return rad2deg(self._sensor_per_ant(name))
 
     @property
@@ -1137,7 +1180,7 @@ class DataSet(object):
         float, shape (*T*, *A*).
 
         """
-        name = 'target_y_%s_%s' % (self.target_projection, self.target_coordsys)
+        name = f'target_y_{self.target_projection}_{self.target_coordsys}'
         return rad2deg(self._sensor_per_ant(name))
 
     @property

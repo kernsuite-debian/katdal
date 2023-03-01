@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -23,11 +23,9 @@
 # 19 December 2011
 #
 
-from __future__ import print_function, division, absolute_import
-
-import os
-import optparse
 import glob
+import optparse
+import os
 
 import katdal
 
@@ -57,7 +55,7 @@ for f in files:
     try:
         d = katdal.open(f, quicklook=True)
     except Exception as e:
-        print('%s %s - %s' % (f, e.__class__.__name__, e))
+        print(f'{f} {e.__class__.__name__} - {e}')
         continue
     name = os.path.basename(f)
     name = (name[:10] + '...') if len(name) > 13 else name

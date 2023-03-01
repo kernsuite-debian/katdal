@@ -1,6 +1,37 @@
 History
 =======
 
+0.20.1 (2022-04-29)
+-------------------
+* Fix broken `dataset.vis[n]` due to DaskLazyIndexer / ChunkStore interaction (#355)
+
+0.20 (2022-04-14)
+-----------------
+* Fix support for dask >= 2022.01.1 in ChunkStore (#351)
+* Allow mvftoms to continue with partial MS after an interruption (#348)
+* New mvf_copy.py script that can be used to extract autocorrelations only (#349)
+* Treat Ceph 403 errors properly in S3ChunkStore (#352)
+
+0.19 (2021-11-23)
+-----------------
+* Support scans and non-radec targets like planets in mvftoms (#333)
+* Expose the raw flags of MVF4 datasets (#335)
+* Expose CBF F-engine sensors: applied delays, phases and gains (#338)
+* Verify that S3 bucket is not empty to detect datasets archived to tape (#344)
+* Populate SIGMA_SPECTRUM and redo SIGMA and WEIGHT in mvftoms (#347)
+* Have a sensible DataSet.name and also add a separate DataSet.url (#337)
+* Allow deselection of antennas using '~m0XX' (#340)
+* Allow nested DaskLazyIndexers (#336)
+* Fix mvftoms on macOS and Python 3.8+ (#339)
+
+0.18 (2021-04-20)
+-----------------
+* Switch to PyJWT 2 and Python 3.6, cleaning up Python 2 relics (#321 - #323)
+* Allow preselection of channels and dumps upon katdal.open() to save time and memory (#324)
+* Allow user to select fields, scans and antennas in mvftoms (#269)
+* Support h5py 3.0 string handling in MVF3 (#331)
+* Refactor requirement files to remove recursive dependencies (#329)
+
 0.17 (2021-01-27)
 -----------------
 * This is the last release that will support Python 3.5

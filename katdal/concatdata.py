@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,20 +15,18 @@
 ################################################################################
 
 """Class for concatenating visibility data sets."""
-from __future__ import print_function, division, absolute_import
-from builtins import zip, range
 
-import os.path
 import itertools
 from functools import reduce
 
 import numpy as np
 
-from .lazy_indexer import LazyIndexer
-from .sensordata import SensorGetter, SensorData, SensorCache, dummy_sensor_getter
-from .categorical import (CategoricalData, unique_in_order,
-                          concatenate_categorical)
+from .categorical import (CategoricalData, concatenate_categorical,
+                          unique_in_order)
 from .dataset import DataSet
+from .lazy_indexer import LazyIndexer
+from .sensordata import (SensorCache, SensorData, SensorGetter,
+                         dummy_sensor_getter)
 
 
 class ConcatenationError(Exception):
@@ -87,7 +85,7 @@ class ConcatenatedLazyIndexer(LazyIndexer):
         descr = [self._name_shape_dtype(self.name, shape, dtype)]
         for n, indexer in enumerate(self.indexers):
             indexer_descr = str(indexer).split('\n')
-            descr += [('- Indexer %03d: ' % (n,)) + indexer_descr[0]]
+            descr += [f'- Indexer {n:03d}: ' + indexer_descr[0]]
             descr += ['               ' + indescr for indescr in indexer_descr[1:]]
         for transform in self.transforms:
             shape, dtype = transform.new_shape(shape), transform.dtype if transform.dtype is not None else dtype
@@ -182,7 +180,7 @@ class ConcatenatedLazyIndexer(LazyIndexer):
         """Shape of data array after first-stage indexing and before transformation."""
         # Each component must have the same shape except for the first dimension (length)
         # The overall length will be the sum of component lengths
-        shape_tails = set([indexer.shape[1:] for indexer in self.indexers])
+        shape_tails = {indexer.shape[1:] for indexer in self.indexers}
         if len(shape_tails) != 1:
             raise ConcatenationError("Incompatible shapes among sub-indexers making up indexer '%s':\n%s" %
                                      (self.name, '\n'.join([repr(indexer) for indexer in self.indexers])))
@@ -192,15 +190,15 @@ class ConcatenatedLazyIndexer(LazyIndexer):
     def _initial_dtype(self):
         """Type of data array before transformation."""
         # Each component must have the same dtype, which becomes the overall dtype
-        dtypes = set([indexer.dtype for indexer in self.indexers])
+        dtypes = {indexer.dtype for indexer in self.indexers}
         if len(dtypes) == 1:
             return dtypes.pop()
         elif np.all([np.issubdtype(dtype, np.string_) for dtype in dtypes]):
             # Strings of different lengths have different dtypes (e.g. '|S1' vs '|S10') but can be safely concatenated
-            return np.dtype('|S%d' % (max([dt.itemsize for dt in dtypes]),))
+            return np.dtype('|S{}'.format(max([dt.itemsize for dt in dtypes])))
         else:
-            raise ConcatenationError("Incompatible dtypes among sub-indexers making up indexer '%s':\n%s" %
-                                     (self.name, '\n'.join([repr(indexer) for indexer in self.indexers])))
+            raise ConcatenationError(f"Incompatible dtypes among sub-indexers making up indexer '{self.name}':\n"
+                                     + '\n'.join([repr(indexer) for indexer in self.indexers]))
 
 # -------------------------------------------------------------------------------------------------
 # -- CLASS :  ConcatenatedSensorGetter
@@ -253,8 +251,8 @@ class ConcatenatedSensorGetter(SensorGetter):
             # but underlying names may legitimately differ for datasets of
             # different minor versions (even within the same version...).
             raise ConcatenationError('Cannot concatenate sensor with different '
-                                     'underlying names: %s' % (names,))
-        super(ConcatenatedSensorGetter, self).__init__(names[0])
+                                     f'underlying names: {names}')
+        super().__init__(names[0])
         self._data = data
 
     def get(self):
@@ -384,7 +382,7 @@ class ConcatenatedSensorCache(SensorCache):
         # Get array, categorical data or raw sensor data from each cache
         split_data = self._get(name, select=select, extract=extract, **kwargs)
         if all(sd is None for sd in split_data):
-            raise KeyError('Key %s not found in any of the concatenated datasets' % name)
+            raise KeyError(f'Key {name} not found in any of the concatenated datasets')
         # If this sensor has already been partially extracted,
         # we are forced to extract it in rest of caches too
         if not extract and not all(sd is None or isinstance(sd, SensorGetter) for sd in split_data):
@@ -497,8 +495,8 @@ class ConcatenatedDataSet(DataSet):
         self.datasets = datasets = [d[-1] for d in decorated_datasets]
 
         # Merge high-level metadata
-        names = unique_in_order([d.name for d in datasets])
-        self.name = ','.join([os.path.basename(name) for name in names])
+        self.name = ','.join(unique_in_order([d.name for d in datasets]))
+        self.url = ' | '.join(unique_in_order([d.url for d in datasets]))
         self.version = ','.join(unique_in_order([d.version for d in datasets]))
         self.observer = ','.join(unique_in_order([d.observer for d in datasets]))
         self.description = ' | '.join(unique_in_order([d.description for d in datasets]))
@@ -517,7 +515,7 @@ class ConcatenatedDataSet(DataSet):
         dump_periods = unique_in_order([d.dump_period for d in datasets])
         if len(dump_periods) > 1:
             raise ConcatenationError('Data sets cannot be concatenated because of differing dump periods: ' +
-                                     ', '.join([('%g' % (dp,)) for dp in dump_periods]))
+                                     ', '.join(f'{dp:g}' for dp in dump_periods))
         self.dump_period = dump_periods[0]
         self._segments = np.cumsum([0] + [len(d.sensor.timestamps) for d in datasets])
         # Keep main time selection mask at top level and ensure that underlying datasets use slice views of main one
@@ -532,7 +530,7 @@ class ConcatenatedDataSet(DataSet):
         self.subarrays = subarray.unique_values
         self.spectral_windows = spw.unique_values
         self.catalogue.add(target.unique_values)
-        self.catalogue.antenna = self.sensor['Antennas/%s/antenna' % (self.ref_ant,)][0]
+        self.catalogue.antenna = self.sensor[f'Antennas/{self.ref_ant}/antenna'][0]
         split_sub = subarray.partition(self._segments)
         split_spw = spw.partition(self._segments)
         split_target = target.partition(self._segments)
@@ -580,29 +578,13 @@ class ConcatenatedDataSet(DataSet):
             Names of selected flag types (or 'all' for the lot)
 
         """
-        if time_keep is not None:
-            self._time_keep = time_keep
-            for n, d in enumerate(self.datasets):
-                d._set_keep(time_keep=self._time_keep[self._segments[n]:self._segments[n + 1]])
-            # Ensure that sensor cache gets updated time selection
-            if self.sensor:
-                self.sensor._set_keep(self._time_keep)
-        if freq_keep is not None:
-            self._freq_keep = freq_keep
-            for n, d in enumerate(self.datasets):
-                d._set_keep(freq_keep=self._freq_keep)
-        if corrprod_keep is not None:
-            self._corrprod_keep = corrprod_keep
-            for n, d in enumerate(self.datasets):
-                d._set_keep(corrprod_keep=self._corrprod_keep)
-        if weights_keep is not None:
-            self._weights_keep = weights_keep
-            for n, d in enumerate(self.datasets):
-                d._set_keep(weights_keep=self._weights_keep)
-        if flags_keep is not None:
-            self._flags_keep = flags_keep
-            for n, d in enumerate(self.datasets):
-                d._set_keep(flags_keep=self._flags_keep)
+        super()._set_keep(time_keep, freq_keep, corrprod_keep, weights_keep, flags_keep)
+        for n, d in enumerate(self.datasets):
+            d._set_keep(time_keep=self._time_keep[self._segments[n]:self._segments[n + 1]],
+                        freq_keep=self._freq_keep,
+                        corrprod_keep=self._corrprod_keep,
+                        weights_keep=self._weights_keep,
+                        flags_keep=self._flags_keep)
 
     @property
     def timestamps(self):

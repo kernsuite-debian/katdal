@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -16,19 +16,12 @@
 
 """Base class for accessing a store of chunks (i.e. N-dimensional arrays)."""
 
-from __future__ import print_function, division, absolute_import
-from builtins import next, zip, range, object
-from future.utils import raise_from
-
 import contextlib
-import functools
-import uuid
 import io
 
-import numpy as np
 import dask
 import dask.array as da
-import dask.highlevelgraph
+import numpy as np
 
 
 class ChunkStoreError(Exception):
@@ -48,7 +41,21 @@ class ChunkNotFound(KeyError, ChunkStoreError):
 
 
 class BadChunk(ValueError, ChunkStoreError):
-    """The chunk is malformed, e.g. bad dtype or slices, wrong buffer size."""
+    """The chunk is malformed, e.g. bad dtype, actual shape differs from requested."""
+
+
+class PlaceholderChunk:
+    """Chunk returned to indicate missing data."""
+
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = np.dtype(dtype)
+
+    def __getitem__(self, index):
+        # Create an array with a zero-sized dtype, so that it takes no memory
+        dummy = np.empty(self.shape, dtype=[])
+        new_shape = dummy[index].shape
+        return PlaceholderChunk(new_shape, self.dtype)
 
 
 def _floor_power_of_two(x):
@@ -121,6 +128,71 @@ def generate_chunks(shape, dtype, max_chunk_size, dims_to_split=None,
     return da.core.blockdims_from_blockshape(shape, dim_elements)
 
 
+class _ArrayLikeGetter:
+    """Present an array-like interface to chunk getter function."""
+
+    def __init__(self, getter, array_name, chunks, dtype, **kwargs):
+        self.getter = getter
+        self.array_name = array_name
+        self.kwargs = kwargs
+        # Basic array-like attributes needed by :func:`dask.array.from_array`
+        self.shape = tuple(sum(c) for c in chunks)
+        self.ndim = len(self.shape)
+        self.dtype = np.dtype(dtype)
+
+    def __getitem__(self, slices, asarray=False, lock=None):
+        """Call chunk getter on slices set up by :func:`dask.array.from_array`."""
+        return self.getter(self.array_name, slices, self.dtype, **self.kwargs)
+
+
+def _prune_chunks(chunks, index, offset=()):
+    """Prune `chunks` spec, removing chunks completely outside slicing `index`.
+
+    Remove the parts of `chunks` that fall outside the slices in `index`.
+    This is done without changing the boundaries and sizes of existing chunks
+    (i.e. without rechunking the data). Instead, the `index` and `offset`
+    are adjusted to select the same data as before after a minimal set of
+    pre-existing chunks are retained.
+
+    This only supports the selection of contiguous regions in `index`.
+    In other words, all slices in `index` need to have unit steps.
+    """
+    chunks = [list(c) for c in chunks]   # Make mutable
+    shape = [sum(c) for c in chunks]
+    index = list(da.slicing.normalize_index(index, shape))
+    if not all(isinstance(idx, slice) and idx.step in (1, None) for idx in index):
+        raise IndexError('Only slices with unit step are valid indices in get_dask_array')
+    offset = list(offset) if offset else [0] * len(shape)
+    for axis in range(len(shape)):
+        if index[axis] == slice(None):
+            continue
+        start, stop, step = index[axis].indices(shape[axis])
+        assert step == 1
+        # Remove unneeded chunks from the ends
+        start_chunk = 0
+        while start_chunk < len(chunks[axis]) and chunks[axis][start_chunk] <= start:
+            c = chunks[axis][start_chunk]
+            offset[axis] += c
+            start -= c
+            stop -= c
+            shape[axis] -= c
+            start_chunk += 1
+        stop_chunk = len(chunks[axis])
+        while stop_chunk > start_chunk and chunks[axis][stop_chunk - 1] <= shape[axis] - stop:
+            stop_chunk -= 1
+            c = chunks[axis][stop_chunk]
+            shape[axis] -= c
+        chunks[axis] = chunks[axis][start_chunk:stop_chunk]
+        if not chunks[axis]:
+            chunks[axis] = (0,)   # Dask doesn't allow empty chunk lists
+        index[axis] = slice(start, stop)
+    # Go back to tuples
+    chunks = tuple(tuple(c) for c in chunks)
+    index = tuple(index)
+    offset = tuple(offset)
+    return chunks, index, offset
+
+
 def _add_offset_to_slices(func, offset):
     """Modify chunk get/put/has to add an offset to its `slices` parameter."""
     def func_with_offset(array_name, slices, *args, **kwargs):
@@ -131,21 +203,17 @@ def _add_offset_to_slices(func, offset):
     return func_with_offset
 
 
-def _scalar_to_chunk(func):
-    """Modify chunk get/put/has to turn a scalar return value into a chunk.
-
-    This modifies the given function so that it returns its result as an
-    ndarray with the same number of (singleton) dimensions as the corresponding
-    chunk to enable assembly into a dask array.
-    """
-
-    def func_returning_chunk(array_name, slices, *args, **kwargs):
-        """Turn scalar return value into chunk of appropriate dimension."""
-        value = func(array_name, slices, *args, **kwargs)
-        singleton_shape = len(slices) * (1,)
-        return np.full(singleton_shape, value)
-
-    return func_returning_chunk
+def _put_map_blocks(chunk, block_info=None, store=None, array_name=None, offset=()):
+    """Adapt `put` to `map_blocks` interface."""
+    put = store.put_chunk_noraise
+    if offset:
+        put = _add_offset_to_slices(put, offset)
+    # Turn block info into slices specification
+    slices = tuple(slice(*loc) for loc in block_info[0]["array-location"])
+    success = put(array_name, slices, chunk)
+    # Turn scalar output into ndarray with same ndims as chunk
+    singleton_shape = chunk.ndim * (1,)
+    return np.full(singleton_shape, success)
 
 
 def npy_header_and_body(chunk):
@@ -170,7 +238,7 @@ def npy_header_and_body(chunk):
     return header, chunk
 
 
-class ChunkStore(object):
+class ChunkStore:
     r"""Base class for accessing a store of chunks (i.e. N-dimensional arrays).
 
     A *chunk* is a simple (i.e. unit-stride) slice of an N-dimensional array
@@ -231,9 +299,11 @@ class ChunkStore(object):
 
         Raises
         ------
+        :exc:`TypeError`
+            If `slices` is not a sequence of slice(start, stop, 1) objects
         :exc:`chunkstore.BadChunk`
-            If requested `dtype` does not match underlying parent array dtype,
-            `slices` has wrong specification or stored buffer has wrong size
+            If requested `dtype` does not match underlying parent array dtype
+            or stored buffer has wrong size / shape compared to `slices`
         :exc:`chunkstore.StoreUnavailable`
             If interaction with chunk store failed (offline, bad auth, bad config)
         :exc:`chunkstore.ChunkNotFound`
@@ -249,12 +319,13 @@ class ChunkStore(object):
             chunk_name, shape = self.chunk_metadata(array_name, slices)
             return np.full(shape, default_value, dtype)
 
-    def get_chunk_or_none(self, array_name, slices, dtype):
-        """Get chunk from the store but return ``None`` if it is missing."""
+    def get_chunk_or_placeholder(self, array_name, slices, dtype):
+        """Get chunk from the store but return a :class:`PlaceholderChunk` if it is missing."""
         try:
             return self.get_chunk(array_name, slices, dtype)
         except ChunkNotFound:
-            return None
+            shape = tuple(s.stop - s.start for s in slices)
+            return PlaceholderChunk(shape, dtype)
 
     def create_array(self, array_name):
         """Create a new array if it does not already exist.
@@ -285,8 +356,10 @@ class ChunkStore(object):
 
         Raises
         ------
+        :exc:`TypeError`
+            If `slices` is not a sequence of slice(start, stop, 1) objects
         :exc:`chunkstore.BadChunk`
-            If `slices` is wrong or its shape does not match that of `chunk`
+            If the shape implied by `slices` does not match that of `chunk`
         :exc:`chunkstore.StoreUnavailable`
             If interaction with chunk store failed (offline, bad auth, bad config)
         :exc:`chunkstore.ChunkNotFound`
@@ -375,32 +448,32 @@ class ChunkStore(object):
 
         Raises
         ------
+        :exc:`TypeError`
+            If `slices` is not a sequence of slice(start, stop, 1) objects
         :exc:`chunkstore.BadChunk`
-            If `slices` has wrong specification or its shape does not match
-            that of `chunk`, or any dtype contains objects
+            If the shape implied by `slices` does not match that of `chunk`,
+            or any dtype contains objects
 
         """
         try:
             shape = tuple(s.stop - s.start for s in slices)
         except (TypeError, AttributeError):
-            raise BadChunk('Array {!r}: chunk ID should be a sequence of '
-                           'slice objects, not {}'.format(array_name, slices))
+            raise TypeError(f'Array {array_name!r}: chunk ID should be a sequence '
+                            f'of slice(start, stop) objects, not {slices}')
         # Verify that all slice strides are unity (i.e. it's a "simple" slice)
         if not all([s.step in (1, None) for s in slices]):
-            raise BadChunk('Array {!r}: chunk ID {} contains non-unit strides'
-                           .format(array_name, slices))
+            raise TypeError(f'Array {array_name!r}: chunk ID {slices} contains non-unit strides')
         # Construct chunk name from array_name + slices
         chunk_name = cls.join(array_name, cls.chunk_id_str(slices))
         if chunk is not None and chunk.shape != shape:
-            raise BadChunk('Chunk {!r}: shape {} implied by slices does not '
-                           'match actual shape {}'
-                           .format(chunk_name, shape, chunk.shape))
+            raise BadChunk(f'Chunk {chunk_name!r}: shape {shape} implied by slices '
+                           f'does not match actual shape {chunk.shape}')
         if chunk is not None and chunk.dtype.hasobject:
-            raise BadChunk('Chunk {!r}: actual dtype {} cannot contain '
-                           'objects'.format(chunk_name, chunk.dtype))
+            raise BadChunk(f'Chunk {chunk_name!r}: actual dtype {chunk.dtype} '
+                           'cannot contain objects')
         if dtype is not None and np.dtype(dtype).hasobject:
-            raise BadChunk('Chunk {!r}: Requested dtype {} cannot contain '
-                           'objects'.format(chunk_name, dtype))
+            raise BadChunk(f'Chunk {chunk_name!r}: Requested dtype {dtype} '
+                           'cannot contain objects')
         return chunk_name, shape
 
     @contextlib.contextmanager
@@ -425,14 +498,13 @@ class ChunkStore(object):
                 # keys, so pick the first one found
                 FirstBase = next(c for c in self._error_map if isinstance(e, c))
                 StandardisedError = self._error_map[FirstBase]
-            prefix = 'Chunk {!r}: '.format(chunk_name) if chunk_name else ''
-            raise_from(StandardisedError(prefix + str(e)), e)
+            prefix = f'Chunk {chunk_name!r}: ' if chunk_name else ''
+            raise StandardisedError(prefix + str(e)) from e
 
-    def get_dask_array(self, array_name, chunks, dtype, offset=(), errors=0):
+    def get_dask_array(self, array_name, chunks, dtype, offset=(), index=(), errors=0):
         """Get dask array from the store.
 
-        Any missing chunks are replaced with zeros, suppressing any
-        :exc:`ChunkNotFound` errors.
+        Handling of missing chunks is determined by the `errors` argument.
 
         Parameters
         ----------
@@ -444,12 +516,12 @@ class ChunkStore(object):
             Data type of array
         offset : tuple of int, optional
             Offset to add to each dimension when addressing chunks in store
-        errors : number or 'raise' or 'none', optional
+        errors : number or 'raise' or 'placeholder', optional
             Error handling. If 'raise', exceptions are passed through,
             causing the evaluation to fail.
 
-            If 'none', returns ``None`` in
-            place of missing chunks. Note that such an array cannot be used
+            If 'placeholder', returns instances of :class:`PlaceholderChunk`
+            in place of missing chunks. Note that such an array cannot be used
             as-is, because an ndarray is expected, but it can be used as raw
             material for building new graphs via functions like
             :func:`da.map_blocks`.
@@ -461,20 +533,45 @@ class ChunkStore(object):
         array : :class:`dask.array.Array` object
             Dask array of given dtype
         """
-        kwargs = {'dtype': dtype}
-        if errors == 'none':
-            get_func = self.get_chunk_or_none
+        getter_kwargs = {}
+        if errors == 'placeholder':
+            getter = self.get_chunk_or_placeholder
         elif errors == 'raise':
-            get_func = self.get_chunk
+            getter = self.get_chunk
+        elif isinstance(errors, str):
+            raise ValueError("Unexpected value for errors; expected 'placeholder', 'raise', or a number")
         else:
-            get_func = self.get_chunk_or_default
-            kwargs['default_value'] = errors
-        getter = functools.partial(get_func, **kwargs)
-        if offset:
+            getter = self.get_chunk_or_default
+            getter_kwargs['default_value'] = errors
+        if index:
+            # XXX For now, _prune_chunks can't handle non-zero offsets as input...
+            # This is not a big deal, since offsets are really meant for put_dask_array
+            # and even then not used much, while `index` only applies to get_dask_array.
+            assert offset == ()
+            chunks, index, offset = _prune_chunks(chunks, index)
+        if any(offset):
             getter = _add_offset_to_slices(getter, offset)
-        # Use dask utility function that forms the core of da.from_array
-        dask_graph = da.core.getem(array_name, chunks, getter)
-        return da.Array(dask_graph, array_name, chunks, dtype)
+        # The final name must differ from array_name, so pick deterministic hash
+        token = da.core.tokenize(self, chunks, dtype, index)
+        out_name = f'{array_name}-{offset}-{token}'
+        getter_shim = _ArrayLikeGetter(getter, array_name, chunks, dtype, **getter_kwargs)
+        from_array_kwargs = {}
+        # XXX Once we depend on dask>=2021.1.0, just set the keyword argument explicitly
+        if dask.utils.has_keyword(da.from_array, 'inline_array'):
+            # Dask 2022.04.0 ignores the custom getter unless this is True
+            from_array_kwargs['inline_array'] = True
+        array = da.from_array(
+            getter_shim,
+            chunks,
+            out_name,
+            # Don't cast chunks to ndarray because some of them may be `PlaceholderChunk`s
+            asarray=False,
+            # Set custom getter anyway to prevent slice fusion during graph optimisation,
+            # which ends up calling chunk store with wrong chunks.
+            getitem=_ArrayLikeGetter.__getitem__,
+            **from_array_kwargs,
+        )
+        return array[index]
 
     def put_dask_array(self, array_name, array, offset=()):
         """Put dask array into the store.
@@ -494,19 +591,13 @@ class ChunkStore(object):
             Dask array of objects indicating success of transfer of each chunk
             (None indicates success, otherwise there is an exception object)
         """
-        # Give better names to these two very similar variables
-        in_name = array.name
-        out_name = array_name
-        # Make out_name unique to avoid clashes and caches
-        out_name = 'store-{}-{}-{}'.format(out_name, offset, uuid.uuid4().hex)
-        put = _scalar_to_chunk(self.put_chunk_noraise)
-        if offset:
-            put = _add_offset_to_slices(put, offset)
-        # Construct output graph on same chunks as input, but with new name
-        graph = da.core.getem(array_name, array.chunks, put, out_name=out_name)
-        # Set chunk parameter of put_chunk() to corresponding key in input array
-        graph = {k: v + ((in_name,) + k[1:],) for k, v in graph.items()}
-        dask_graph = dask.highlevelgraph.HighLevelGraph.from_collections(out_name, graph, [array])
-        # The success array has one element per chunk in the input array
-        out_chunks = tuple(len(c) * (1,) for c in array.chunks)
-        return da.Array(dask_graph, out_name, out_chunks, np.object)
+        return da.map_blocks(
+            _put_map_blocks,
+            array,
+            name=f'store-{array_name}-{offset}',
+            dtype=object,
+            chunks=array.ndim * (1,),
+            store=self,
+            array_name=array_name,
+            offset=offset,
+        )

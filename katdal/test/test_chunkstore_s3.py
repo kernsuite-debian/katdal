@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -26,44 +26,41 @@ an older version is detected, the test will be skipped.
 .. _minio: https://github.com/minio/minio
 .. _race condition: https://github.com/minio/minio/issues/6324
 """
-from __future__ import print_function, division, absolute_import
-from future import standard_library
-standard_library.install_aliases()     # noqa: E402
-from future.utils import bytes_to_native_str
 
-import tempfile
-import shutil
-import threading
-import time
-import socket
-import http.server
-import urllib.parse
 import contextlib
+import http.server
 import io
 import os
-import warnings
-import re
 import pathlib
-from urllib3.util.retry import Retry
+import re
+import shutil
+import socket
+import tempfile
+import threading
+import time
+import urllib.parse
+import warnings
 
-import numpy as np
-from numpy.testing import assert_array_equal
-from nose import SkipTest
-from nose.tools import assert_raises, assert_equal, timed
-import requests
 import jwt
 import katsdptelstate
+import numpy as np
+import requests
 from katsdptelstate.rdb_writer import RDBWriter
+from nose import SkipTest
+from nose.tools import (assert_equal, assert_in, assert_not_in, assert_raises,
+                        timed)
+from numpy.testing import assert_array_equal
+from urllib3.util.retry import Retry
 
-from katdal.chunkstore_s3 import (S3ChunkStore, _AWSAuth, read_array,
-                                  decode_jwt, InvalidToken, TruncatedRead,
-                                  _DEFAULT_SERVER_GLITCHES)
-from katdal.chunkstore import StoreUnavailable, ChunkNotFound
-from katdal.test.test_chunkstore import ChunkStoreTestBase
-from katdal.test.s3_utils import S3User, S3Server, MissingProgram
+from katdal.chunkstore import ChunkNotFound, StoreUnavailable
+from katdal.chunkstore_s3 import (_DEFAULT_SERVER_GLITCHES, InvalidToken,
+                                  S3ChunkStore, TruncatedRead, _AWSAuth,
+                                  AuthorisationFailed, decode_jwt, read_array)
 from katdal.datasources import TelstateDataSource
-from katdal.test.test_datasources import make_fake_data_source, assert_telstate_data_source_equal
-
+from katdal.test.s3_utils import MissingProgram, S3Server, S3User
+from katdal.test.test_chunkstore import ChunkStoreTestBase
+from katdal.test.test_datasources import (assert_telstate_data_source_equal,
+                                          make_fake_data_source)
 
 # Use a standard bucket for most tests to ensure valid bucket name (regex '^[0-9a-z.-]{3,63}$')
 BUCKET = 'katdal-unittest'
@@ -98,7 +95,7 @@ def get_free_port(host):
         yield port
 
 
-class TestReadArray(object):
+class TestReadArray:
     def _test(self, array):
         fp = io.BytesIO()
         np.save(fp, array)
@@ -160,11 +157,13 @@ class TestReadArray(object):
 def encode_jwt(header, payload, signature=86 * 'x'):
     """Generate JWT token with encoded signature (dummy ES256 one by default)."""
     # Don't specify algorithm='ES256' here since that needs cryptography package
-    token_bytes = jwt.encode(payload, '', algorithm='none', headers=header)
-    return bytes_to_native_str(token_bytes) + signature
+    # This generates an Unsecured JWS without a signature: '<header>.<payload>.'
+    header_payload = jwt.encode(payload, '', algorithm='none', headers=header)
+    # Now tack on a signature that nominally matches the header
+    return header_payload + signature
 
 
-class TestTokenUtils(object):
+class TestTokenUtils:
     """Test token utility and validation functions."""
 
     def test_jwt_broken_token(self):
@@ -192,6 +191,15 @@ class TestTokenUtils(object):
         payload = {'exp': 0, 'iss': 'kat', 'prefix': ['123']}
         token = encode_jwt(header, payload)
         assert_raises(InvalidToken, decode_jwt, token)
+        # Check that expiration time is not-too-large integer
+        payload['exp'] = 1.2
+        assert_raises(InvalidToken, decode_jwt, encode_jwt(header, payload))
+        payload['exp'] = 12345678901234567890
+        assert_raises(InvalidToken, decode_jwt, encode_jwt(header, payload))
+        # Check that it works without expiry date too
+        del payload['exp']
+        claims = decode_jwt(encode_jwt(header, payload))
+        assert_equal(payload, claims)
 
 
 class TestS3ChunkStore(ChunkStoreTestBase):
@@ -242,11 +250,28 @@ class TestS3ChunkStore(ChunkStoreTestBase):
             cls.minio.close()
         shutil.rmtree(cls.tempdir)
 
+    def setup(self):
+        # The server is a class-level fixture (for efficiency), so state can
+        # leak between tests. Prevent that by removing any existing objects.
+        # It's easier to do that by manipulating the filesystem directly than
+        # trying to use the S3 API.
+        data_dir = os.path.join(self.tempdir, 'data')
+        for entry in os.scandir(data_dir):
+            if not entry.name.startswith('.') and entry.is_dir():
+                shutil.rmtree(entry.path)
+        # Also get rid of the cache of verified buckets
+        self.store._verified_buckets.clear()
+
     def array_name(self, name):
         """Ensure that bucket is authorised and has valid name."""
         if name.startswith(PREFIX):
             return name
         return self.store.join(BUCKET, name)
+
+    def test_chunk_non_existent(self):
+        # An empty bucket will trigger StoreUnavailable so put something in there first
+        self.store.mark_complete(self.array_name('crumbs'))
+        return super().test_chunk_non_existent()
 
     def test_public_read(self):
         url, kwargs = self.prepare_store_args(self.s3_url, credentials=None)
@@ -258,8 +283,7 @@ class TestS3ChunkStore(ChunkStoreTestBase):
         x = np.arange(5)
         self.store.create_array('private/x')
         self.store.put_chunk('private/x', slices, x)
-        # Ceph RGW returns 403 for missing chunks too so we see ChunkNotFound
-        with assert_raises(ChunkNotFound):
+        with assert_raises(AuthorisationFailed):
             reader.get_chunk('private/x', slices, x.dtype)
 
         # Now a public-read array
@@ -274,7 +298,7 @@ class TestS3ChunkStore(ChunkStoreTestBase):
     def test_store_unavailable_unresponsive_server(self):
         host = '127.0.0.1'
         with get_free_port(host) as port:
-            url = 'http://{}:{}/'.format(host, port)
+            url = f'http://{host}:{port}/'
             store = S3ChunkStore(url, timeout=0.1, retries=0)
             with assert_raises(StoreUnavailable):
                 store.is_complete('store_is_not_listening_on_that_port')
@@ -293,7 +317,7 @@ class TestS3ChunkStore(ChunkStoreTestBase):
         telstate['capture_block_id'] = cbid
         telstate['stream_name'] = sn
         # Save telstate to temp RDB file since RDBWriter needs a filename and not a handle
-        rdb_filename = '{}_{}.rdb'.format(cbid, sn)
+        rdb_filename = f'{cbid}_{sn}.rdb'
         temp_filename = os.path.join(self.tempdir, rdb_filename)
         with RDBWriter(temp_filename) as rdbw:
             rdbw.save(telstate)
@@ -307,6 +331,23 @@ class TestS3ChunkStore(ChunkStoreTestBase):
         source_from_url = TelstateDataSource.from_url(rdb_url, **self.store_kwargs)
         source_direct = TelstateDataSource(view, cbid, sn, self.store)
         assert_telstate_data_source_equal(source_from_url, source_direct)
+
+    def test_missing_or_empty_buckets(self):
+        slices = (slice(0, 1),)
+        dtype = np.dtype(np.float)
+        # Without create_array the bucket is missing
+        with assert_raises(StoreUnavailable):
+            self.store.get_chunk(f'{BUCKET}-missing/x', slices, dtype)
+        self.store.create_array(f'{BUCKET}-empty/x')
+        # Without put_chunk the bucket is empty
+        with assert_raises(StoreUnavailable):
+            self.store.get_chunk(f'{BUCKET}-empty/x', slices, dtype)
+        # Check that the standard bucket has not been verified yet
+        bucket_url = urllib.parse.urljoin(self.store._url, BUCKET)
+        assert_not_in(bucket_url, self.store._verified_buckets)
+        # Check that the standard bucket remains verified after initial check
+        self.test_chunk_non_existent()
+        assert_in(bucket_url, self.store._verified_buckets)
 
 
 class _TokenHTTPProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -361,8 +402,8 @@ class _TokenHTTPProxyHandler(http.server.BaseHTTPRequestHandler):
                     pause = READ_PAUSE if flavour == 'pause' else 0.0
                     glitch_location = int(glitch.group(2))
                 else:
-                    raise ValueError("Unknown command '{}' in proxy suggestion {}"
-                                     .format(command, suggestion))
+                    raise ValueError(f"Unknown command '{command}' "
+                                     f'in proxy suggestion {suggestion}')
             else:
                 # We're done with this suggestion since its time ran out
                 del self.server.initial_request_time[key]
@@ -378,8 +419,7 @@ class _TokenHTTPProxyHandler(http.server.BaseHTTPRequestHandler):
         except InvalidToken:
             prefixes = []
         if not any(self.path.lstrip('/').startswith(prefix) for prefix in prefixes):
-            self.send_response(401, 'Unauthorized (got: {}, allowed: {})'
-                                    .format(self.path, prefixes))
+            self.send_response(401, f'Unauthorized (got: {self.path}, allowed: {prefixes})')
             self.end_headers()
             return
 
@@ -434,8 +474,7 @@ class _TokenHTTPProxyHandler(http.server.BaseHTTPRequestHandler):
         time_offset = now - initial_time
         # Print to stdout instead of stderr so that it doesn't spew all over
         # the screen in normal operation.
-        print("Token proxy: %s (%.3f) %s" % (self.log_date_time_string(),
-                                             time_offset, format % args))
+        print(f"Token proxy: {self.log_date_time_string()} ({time_offset:.3f}) {format % args}")
 
 
 class _TokenHTTPProxyServer(http.server.HTTPServer):
@@ -446,8 +485,7 @@ class _TokenHTTPProxyServer(http.server.HTTPServer):
     """
     def server_bind(self):
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        # In Python 2.7 it's an old-style class, so super doesn't work
-        http.server.HTTPServer.server_bind(self)
+        super().server_bind()
 
 
 class TestS3ChunkStoreToken(TestS3ChunkStore):
@@ -457,7 +495,7 @@ class TestS3ChunkStoreToken(TestS3ChunkStore):
     def setup_class(cls):
         cls.proxy_url = None
         cls.httpd = None
-        super(TestS3ChunkStoreToken, cls).setup_class()
+        super().setup_class()
 
     @classmethod
     def teardown_class(cls):
@@ -467,7 +505,7 @@ class TestS3ChunkStoreToken(TestS3ChunkStore):
             cls.httpd = None
             cls.httpd_thread.join()
             cls.httpd_thread = None
-        super(TestS3ChunkStoreToken, cls).teardown_class()
+        super().teardown_class()
 
     @classmethod
     def prepare_store_args(cls, url, **kwargs):
@@ -486,7 +524,7 @@ class TestS3ChunkStoreToken(TestS3ChunkStore):
             # because teardown calls httpd.shutdown and that hangs if
             # serve_forever wasn't called.
             cls.httpd = httpd
-            cls.proxy_url = 'http://{}:{}'.format(proxy_host, proxy_port)
+            cls.proxy_url = f'http://{proxy_host}:{proxy_port}'
         elif url != cls.httpd.target:
             raise RuntimeError('Cannot use multiple target URLs with http proxy')
         # The token authorises the standard bucket and anything starting with PREFIX

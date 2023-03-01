@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2019, National Research Foundation (Square Kilometre Array)
+# Copyright (c) 2017-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -15,26 +15,21 @@
 ################################################################################
 
 """Various sources of correlator data and metadata."""
-from __future__ import print_function, division, absolute_import
-from future import standard_library
-standard_library.install_aliases()  # noqa: 402
-from builtins import object
-from future.utils import raise_from
 
-import urllib.parse
-import os.path
 import io
 import logging
+import os.path
+import urllib.parse
 
 import katsdptelstate
 import numpy as np
 
-from .sensordata import TelstateSensorGetter, TelstateToStr
-from .chunkstore_s3 import S3ChunkStore
-from .chunkstore_npy import NpyFileChunkStore
 from .chunkstore import ChunkStoreError
+from .chunkstore_npy import NpyFileChunkStore
+from .chunkstore_s3 import S3ChunkStore
+from .dataset import parse_url_or_path
+from .sensordata import TelstateSensorGetter, TelstateToStr
 from .vis_flags_weights import ChunkStoreVisFlagsWeights
-
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +38,7 @@ class DataSourceNotFound(Exception):
     """File associated with DataSource not found or server not responding."""
 
 
-class AttrsSensors(object):
+class AttrsSensors:
     """Metadata in the form of attributes and sensors.
 
     Parameters
@@ -52,17 +47,14 @@ class AttrsSensors(object):
         Metadata attributes
     sensors : mapping from string to :class:`SensorGetter` objects
         Metadata sensor cache mapping sensor names to raw sensor data
-    name : string, optional
-        Identifier that describes the origin of the metadata (backend-specific)
 
     """
-    def __init__(self, attrs, sensors, name='custom'):
+    def __init__(self, attrs, sensors):
         self.attrs = attrs
         self.sensors = sensors
-        self.name = name
 
 
-class DataSource(object):
+class DataSource:
     """A generic data source presenting both correlator data and metadata.
 
     Parameters
@@ -79,13 +71,8 @@ class DataSource(object):
         self.metadata = metadata
         self.timestamps = timestamps
         self.data = data
-
-    @property
-    def name(self):
-        name = self.metadata.name
-        if self.data and self.data.name != name:
-            name += ' | ' + self.data.name
-        return name
+        self.name = ''
+        self.url = ''
 
 
 def view_capture_stream(telstate, capture_block_id, stream_name):
@@ -170,24 +157,23 @@ def view_l0_capture_stream(telstate, capture_block_id=None, stream_name=None,
         try:
             capture_block_id = telstate['capture_block_id']
         except KeyError as e:
-            raise_from(ValueError('No capture block ID found in telstate - '
-                                  'please specify it manually'), e)
+            raise ValueError('No capture block ID found in telstate - '
+                             'please specify it manually') from e
     # Detect the captured stream
     if not stream_name:
         try:
             stream_name = telstate['stream_name']
         except KeyError as e:
-            raise_from(ValueError('No captured stream found in telstate - '
-                                  'please specify the stream manually'), e)
+            raise ValueError('No captured stream found in telstate - '
+                             'please specify the stream manually') from e
     # Build the view
     telstate = view_capture_stream(telstate, capture_block_id, stream_name)
     # Check the stream type
     stream_type = telstate.get('stream_type', 'unknown')
     expected_type = 'sdp.vis'
     if stream_type != expected_type:
-        raise ValueError("Found stream {!r} but it has the wrong type {!r},"
-                         " expected {!r}".format(stream_name, stream_type,
-                                                 expected_type))
+        raise ValueError(f"Found stream {stream_name!r} but it has the wrong type "
+                         f"{stream_type!r}, expected {expected_type!r}")
     logger.info('Using capture block %r and stream %r',
                 capture_block_id, stream_name)
     return telstate, capture_block_id, stream_name
@@ -230,10 +216,8 @@ def _upgrade_chunk_info(chunk_info, improved_chunk_info):
     for key, improved_info in improved_chunk_info.items():
         original_info = chunk_info.get(key, improved_info)
         if improved_info['shape'][1:] != original_info['shape'][1:]:
-            raise ValueError("Original '{}' array has shape {} while improved"
-                             "version has shape {}"
-                             .format(key, original_info['shape'],
-                                     improved_info['shape']))
+            raise ValueError(f"Original '{key}' array has shape {original_info['shape']} "
+                             f"while improved version has shape {improved_info['shape']}")
         chunk_info[key] = improved_info
     return chunk_info
 
@@ -348,12 +332,18 @@ class TelstateDataSource(DataSource):
         Chunk store for visibility data (the default is no data - metadata only)
     timestamps : array of float, optional
         Visibility timestamps, overriding (or fixing) the ones found in telstate
-    source_name : string, optional
-        Name of telstate source (used for metadata name)
+    url : string, optional
+        Location of the telstate source
     upgrade_flags : bool, optional
         Look for associated flag streams and use them if True (default)
     van_vleck : {'off', 'autocorr'}, optional
         Type of Van Vleck (quantisation) correction to perform
+    preselect : dict, optional
+        Subset of data to select. The keys in the dictionary correspond to the
+        keyword arguments of :meth:`.DataSet.select`, but with restrictions:
+
+        - Only ``channels`` and ``dumps`` can be specified.
+        - The values must be slices with unit step.
     kwargs : dict, optional
         Extra keyword arguments, typically meant for other methods and ignored
 
@@ -361,10 +351,21 @@ class TelstateDataSource(DataSource):
     ------
     KeyError
         If telstate lacks critical keys
+    IndexError
+        If `preselect` does not meet the criteria above.
     """
     def __init__(self, telstate, capture_block_id, stream_name,
-                 chunk_store=None, timestamps=None, source_name='telstate',
-                 upgrade_flags=True, van_vleck='off', **kwargs):
+                 chunk_store=None, timestamps=None, url='',
+                 upgrade_flags=True, van_vleck='off', preselect=None, **kwargs):
+        if preselect is None:
+            preselect = {}
+        unexpected = set(preselect.keys()) - {'channels', 'dumps'}
+        if unexpected:
+            raise IndexError("'preselect' can only specify 'channels' and 'dumps'")
+        for key, idx in preselect.items():
+            if not isinstance(idx, slice) or idx.step not in {None, 1}:
+                raise IndexError(f'{key} must be a slice with unit step')
+
         self.telstate = TelstateToStr(telstate)
         # Collect sensors
         sensors = {}
@@ -373,7 +374,7 @@ class TelstateDataSource(DataSource):
                 sensor_name = _shorten_key(telstate, key)
                 if sensor_name:
                     sensors[sensor_name] = TelstateSensorGetter(telstate, key)
-        metadata = AttrsSensors(telstate, sensors, name=source_name)
+        metadata = AttrsSensors(telstate, sensors)
         if chunk_store is not None or timestamps is None:
             chunk_info = telstate['chunk_info']
             chunk_info = _ensure_prefix_is_set(chunk_info, telstate)
@@ -385,10 +386,15 @@ class TelstateDataSource(DataSource):
             data = None
         else:
             need_weights_power_scale = telstate.get('need_weights_power_scale', False)
+            if preselect:
+                index = (preselect.get('dumps', np.s_[:]), preselect.get('channels', np.s_[:]))
+            else:
+                index = ()
             data = ChunkStoreVisFlagsWeights(chunk_store, chunk_info,
                                              corrprods=telstate['bls_ordering'],
                                              stored_weights_are_scaled=not need_weights_power_scale,
-                                             van_vleck=van_vleck)
+                                             van_vleck=van_vleck,
+                                             index=index)
 
         if timestamps is None:
             # Synthesise timestamps from the relevant telstate bits
@@ -396,26 +402,36 @@ class TelstateDataSource(DataSource):
             int_time = telstate['int_time']
             n_dumps = chunk_info['correlator_data']['shape'][0]
             timestamps = t0 + np.arange(n_dumps) * int_time
+        if 'dumps' in preselect:
+            timestamps = timestamps[preselect['dumps']]
         # Metadata and timestamps with or without data
         DataSource.__init__(self, metadata, timestamps, data)
         self.capture_block_id = capture_block_id
         self.stream_name = stream_name
+        self.url = url
+        self.name = f'{capture_block_id}_{stream_name}'
 
     @classmethod
     def from_url(cls, url, chunk_store='auto', **kwargs):
-        """Construct TelstateDataSource from URL (RDB file / REDIS server).
+        """Construct TelstateDataSource from URL or RDB filename.
+
+        The following URL styles are supported:
+
+          - Local RDB filename (no scheme): '1556574656/1556574656_sdp_l0.rdb'
+          - Archive: 'https://archive/1556574656/1556574656_sdp_l0.rdb?token=<>'
+          - Redis server: 'redis://cal5.sdp.mkat.karoo.kat.ac.za:31852'
 
         Parameters
         ----------
         url : string
-            URL serving as entry point to dataset (typically RDB file or REDIS)
+            URL or RDB filename serving as entry point to data set
         chunk_store : :class:`katdal.ChunkStore` object, optional
             Chunk store for visibility data (obtained automatically by default,
-            or set to None for metadata-only dataset)
+            or set to None for metadata-only data set)
         kwargs : dict, optional
             Extra keyword arguments passed to init, telstate view, chunk store init
         """
-        url_parts = urllib.parse.urlparse(url, scheme='file')
+        url_parts = parse_url_or_path(url)
         # Merge key-value pairs from URL query with keyword arguments
         # of function (the latter takes precedence)
         url_kwargs = dict(urllib.parse.parse_qsl(url_parts.query))
@@ -429,13 +445,13 @@ class TelstateDataSource(DataSource):
             try:
                 telstate.load_from_file(url_parts.path)
             except (OSError, katsdptelstate.RdbParseError) as e:
-                raise_from(DataSourceNotFound(str(e)), e)
+                raise DataSourceNotFound(str(e)) from e
         elif url_parts.scheme == 'redis':
             # Redis server
             try:
                 telstate = katsdptelstate.TelescopeState(url_parts.netloc, db)
             except katsdptelstate.ConnectionError as e:
-                raise_from(DataSourceNotFound(str(e)), e)
+                raise DataSourceNotFound(str(e)) from e
         elif url_parts.scheme in {'http', 'https'}:
             # Treat URL prefix as an S3 object store (with auth info in kwargs)
             store_url = urllib.parse.urljoin(url, '..')
@@ -448,14 +464,14 @@ class TelstateDataSource(DataSource):
                 with rdb_store.request('GET', rdb_url) as response:
                     telstate.load_from_file(io.BytesIO(response.content))
             except ChunkStoreError as e:
-                raise_from(DataSourceNotFound(str(e)), e)
+                raise DataSourceNotFound(str(e)) from e
             # If the RDB file is opened via archive URL, use that URL and
             # corresponding S3 credentials or token to access the chunk store
             if chunk_store == 'auto' and not kwargs.get('s3_endpoint_url'):
                 chunk_store = rdb_store
         else:
-            raise DataSourceNotFound("Unknown URL scheme '{}' - telstate expects "
-                                     "file, redis, or http(s)".format(url_parts.scheme))
+            raise DataSourceNotFound(f"Unknown URL scheme '{url_parts.scheme}' - "
+                                     'telstate expects file, redis, or http(s)')
         telstate, capture_block_id, stream_name = view_l0_capture_stream(telstate, **kwargs)
         if chunk_store == 'auto':
             chunk_store = infer_chunk_store(url_parts, telstate, **kwargs)
@@ -463,7 +479,7 @@ class TelstateDataSource(DataSource):
         kwargs.pop('capture_block_id', None)
         kwargs.pop('stream_name', None)
         return cls(telstate, capture_block_id, stream_name, chunk_store,
-                   source_name=url_parts.geturl(), **kwargs)
+                   url=url_parts.geturl(), **kwargs)
 
 
 def open_data_source(url, **kwargs):
@@ -472,9 +488,8 @@ def open_data_source(url, **kwargs):
         return TelstateDataSource.from_url(url, **kwargs)
     except DataSourceNotFound as e:
         # Amend the error message for the case of an IP address without scheme
-        url_parts = urllib.parse.urlparse(url, scheme='file')
-        if url_parts.scheme == 'file' and not os.path.isfile(url_parts.path):
-            raise_from(DataSourceNotFound(
-                '{} (add a URL scheme if {!r} is not meant to be a file)'
-                .format(e, url_parts.path)), e)
+        url_parts = urllib.parse.urlparse(url)
+        if not url_parts.scheme and not os.path.isfile(url_parts.path):
+            raise DataSourceNotFound(f'{e} (add a URL scheme if {url_parts.path!r} '
+                                     'is not meant to be a file)') from e
         raise
