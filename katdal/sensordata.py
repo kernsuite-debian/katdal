@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2022, National Research Foundation (SARAO)
+# Copyright (c) 2011-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -214,7 +214,7 @@ def telstate_decode(raw, no_decode=()):
     The return value is also passed through :func:`to_str`.
     """
     if isinstance(raw, (np.void, np.ndarray)):
-        return to_str(katsdptelstate.decode_value(raw.tostring()))
+        return to_str(katsdptelstate.decode_value(raw.tobytes()))
     raw_str = to_str(raw)
     if raw_str in no_decode:
         return raw_str
@@ -270,7 +270,7 @@ class H5TelstateSensorGetter(RecordSensorGetter):
         values = [_h5_telstate_unpack(s) for s in self._data['value']]
         # Figure out dtype and wrap any objects
         dtype = infer_dtype(values)
-        if dtype == np.object:
+        if dtype == object:
             values = [ComparableArrayWrapper(value) for value in values]
         return SensorData(self.name, timestamp, to_str(np.asarray(values)))
 
@@ -378,7 +378,7 @@ class TelstateSensorGetter(SensorGetter):
     def get(self):
         values, times = zip(*self._telstate.get_range(self.name, st=0))
         dtype = infer_dtype(values)
-        if dtype == np.object:
+        if dtype == object:
             values = [ComparableArrayWrapper(v) for v in values]
         return SensorData(self.name, np.asarray(times), np.asarray(values))
 
@@ -485,7 +485,7 @@ def dummy_sensor_getter(name, value=None, dtype=np.float64, timestamp=0.0):
             value = False
     else:
         dtype = infer_dtype([value])
-    if dtype == np.object:
+    if dtype == object:
         value = ComparableArrayWrapper(value)
     return SimpleSensorGetter(name, np.array([timestamp]), np.array([value]))
 

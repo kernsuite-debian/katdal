@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2022, National Research Foundation (SARAO)
+# Copyright (c) 2017-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -190,8 +190,10 @@ def correct_autocorr_quantisation(vis, corrprods, levels=None):
                                            quantised_autocorr_table, true_autocorr_table)
         return out
 
-    return da.blockwise(_correct_autocorr_quant, 'ijk', vis, 'ijk', dtype=np.complex64,
-                        name='van-vleck-autocorr-' + vis.name)
+    return da.blockwise(_correct_autocorr_quant, 'ijk', vis, 'ijk',
+                        name='van-vleck-autocorr-' + vis.name,
+                        dtype=vis.dtype,
+                        meta=np.empty(vis.ndim * (0,), vis.dtype))
 
 
 @numba.jit(nopython=True, nogil=True)

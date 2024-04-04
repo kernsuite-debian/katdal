@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2022, National Research Foundation (SARAO)
+# Copyright (c) 2017-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -20,12 +20,11 @@ import os
 import shutil
 import tempfile
 
-from nose import SkipTest
-from nose.tools import assert_raises
+import pytest
 
 from katdal.chunkstore import StoreUnavailable
 from katdal.chunkstore_npy import NpyFileChunkStore
-from katdal.test.test_chunkstore import ChunkStoreTestBase
+from katdal.test.test_chunkstore import ChunkStoreTestBase, generate_arrays
 
 
 class TestNpyFileChunkStore(ChunkStoreTestBase):
@@ -34,6 +33,7 @@ class TestNpyFileChunkStore(ChunkStoreTestBase):
     @classmethod
     def setup_class(cls):
         """Create temp dir to store NPY files and build ChunkStore on that."""
+        cls.arrays = generate_arrays()
         cls.tempdir = tempfile.mkdtemp()
         cls.store = NpyFileChunkStore(cls.tempdir)
 
@@ -41,14 +41,15 @@ class TestNpyFileChunkStore(ChunkStoreTestBase):
     def teardown_class(cls):
         shutil.rmtree(cls.tempdir)
 
-    def setup(self):
+    def setup_method(self):
         # Clean out data created by previous tests
         for entry in os.scandir(self.tempdir):
             if not entry.name.startswith('.') and entry.is_dir():
                 shutil.rmtree(entry.path)
 
     def test_store_unavailable(self):
-        assert_raises(StoreUnavailable, NpyFileChunkStore, 'hahahahahaha')
+        with pytest.raises(StoreUnavailable):
+            NpyFileChunkStore('hahahahahaha')
 
 
 class TestNpyFileChunkStoreDirectWrite(TestNpyFileChunkStore):
@@ -62,5 +63,5 @@ class TestNpyFileChunkStoreDirectWrite(TestNpyFileChunkStore):
             cls.store = NpyFileChunkStore(cls.tempdir, direct_write=True)
         except StoreUnavailable as e:
             if 'not supported' in str(e):
-                raise SkipTest(str(e))
+                pytest.skip(str(e))
             raise

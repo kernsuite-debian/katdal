@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2011-2022, National Research Foundation (SARAO)
+# Copyright (c) 2011-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -29,6 +29,7 @@ setup(name='katdal',
       description='Karoo Array Telescope data access library for interacting '
                   'with data sets in the MeerKAT Visibility Format (MVF)',
       long_description=long_description,
+      long_description_content_type='text/x-rst',
       author='Ludwig Schwardt',
       author_email='ludwig@ska.ac.za',
       packages=find_packages(),
@@ -61,4 +62,4 @@ setup(name='katdal',
           's3': [],
           's3credentials': ['botocore']
       },
-      tests_require=['nose'])
+      tests_require=['cryptography', 'pytest'])
