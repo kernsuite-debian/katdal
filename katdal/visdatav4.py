@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2022, National Research Foundation (SARAO)
+# Copyright (c) 2017-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -276,7 +276,7 @@ class VisibilityDataV4(DataSet):
         half_dump = 0.5 * self.dump_period
         self.start_time = katpoint.Timestamp(source.timestamps[0] - half_dump)
         self.end_time = katpoint.Timestamp(source.timestamps[-1] + half_dump)
-        self._time_keep = np.full(num_dumps, True, dtype=np.bool_)
+        self._time_keep = np.full(num_dumps, True, dtype=bool)
         all_dumps = [0, num_dumps]
 
         # Assemble sensor cache
@@ -638,7 +638,7 @@ class VisibilityDataV4(DataSet):
             def bitwise_and(flags): return da.bitwise_and(select, flags)
             flag_transforms.append(bitwise_and)
         # View uint8 as bool (can still be undone by flags.view(np.uint8))
-        def view_as_bool(flags): return flags.view(np.bool_)
+        def view_as_bool(flags): return flags.view(bool)
         flag_transforms.append(view_as_bool)
         self._flags = DaskLazyIndexer(self._raw_flags, transforms=flag_transforms)
 

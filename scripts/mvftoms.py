@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2011-2022, National Research Foundation (SARAO)
+# Copyright (c) 2011-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -370,7 +370,7 @@ def main():
 
     # get a set of user selected available tracking scans, ignore slew scans
     avail_tracks = list(map(lambda x: x[0],
-                            filter(lambda x: x[1] == 'track',
+                            filter(lambda x: x[1] in ('track','scan'),
                                    dataset.scans())))
     dump_scans = options.scans if options.scans else avail_tracks
     dump_scans = list(set(dump_scans).intersection(set(avail_tracks)))
