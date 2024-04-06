@@ -1,4 +1,11 @@
-katdal (0.22-1kern1) jammy; urgency=medium
+katdal (0.22-1kern2) jammy; urgency=medium
+
+  [ Athanaseus Javas Ramaila ]
+  * Remove remnant deps
+
+ -- KERN packaging <packaging@kernsuite.info>  Thu, 06 Apr 2024 21:49:38 +0000
+
+katdal (0.22-1kern2) jammy; urgency=medium
 
   [ Athanaseus Javas Ramaila ]
   * New upstream version 0.22
