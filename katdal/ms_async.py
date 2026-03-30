@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2018-2023, National Research Foundation (SARAO)
+# Copyright (c) 2018-2019,2021-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -41,7 +41,7 @@ class RawArray:
     def __init__(self, shape, dtype):
         self.shape = shape
         self.dtype = np.dtype(dtype)
-        size = self.dtype.itemsize * int(np.product(shape))
+        size = self.dtype.itemsize * int(np.prod(shape))
         self.storage = multiprocessing.sharedctypes.RawArray('c', size)
 
     def asarray(self):

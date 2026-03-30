@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2018-2023, National Research Foundation (SARAO)
+# Copyright (c) 2018-2021,2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -65,8 +65,8 @@ for st in range(0, f.shape[0], args.time):
     current_time = time.time()
     elapsed = current_time - last_time
     last_time = current_time
-    size = np.product(vis.shape) * 10
+    size = np.prod(vis.shape) * 10
     logging.info('Loaded %d dumps (%.3f MB/s)', vis.shape[0], size / elapsed / 1e6)
-size = np.product(f.shape) * 10
+size = np.prod(f.shape) * 10
 elapsed = time.time() - start
 logging.info('Loaded %d bytes in %.3f s (%.3f MB/s)', size, elapsed, size / elapsed / 1e6)

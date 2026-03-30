@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2023, National Research Foundation (SARAO)
+# Copyright (c) 2011-2019,2021-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -167,7 +167,7 @@ def kat_ms_desc_and_dminfo(nbl, nchan, ncorr, model_data=False):
 
         # Try bump up the number of rows in our tiles while they're
         # below the memory limit for the tile
-        while np.product(rev_shape + [2*ntilerows])*nbytes < tile_mem_limit:
+        while np.prod(rev_shape + [2*ntilerows])*nbytes < tile_mem_limit:
             ntilerows *= 2
 
         return {"DEFAULTTILESHAPE": np.int32(rev_shape + [ntilerows])}
