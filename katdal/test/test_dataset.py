@@ -1,5 +1,5 @@
 ###############################################################################
-# Copyright (c) 2018-2023, National Research Foundation (SARAO)
+# Copyright (c) 2018-2019,2021-2024, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -302,4 +302,25 @@ def test_select_targets(caplog, dataset, targets, expected_dumps):
     # If the target is not found, check that a warning is logged
     if len(expected_dumps) == 0:
         assert 'Skipping unknown selected target' in caplog.text
+    assert_array_equal(dataset.dumps, expected_dumps)
+
+
+@pytest.mark.parametrize(
+    'target_tags,expected_dumps',
+    [
+        ('radec', np.arange(12)),
+        ('bpcal', [0, 1, 2, 6, 7, 8]),
+        ('gaincal', [3, 4, 5]),
+        ('gaincal,incorrect_tag', [3, 4, 5]),
+        (['gaincal'], [3, 4, 5]),
+        ('bpcal,gaincal', [0, 1, 2, 3, 4, 5, 6, 7, 8]),
+        (('bpcal', 'gaincal'), [0, 1, 2, 3, 4, 5, 6, 7, 8]),
+        ('incorrect_tag', []),
+    ]
+)
+def test_select_target_tags(caplog, dataset, target_tags, expected_dumps):
+    with caplog.at_level(logging.WARNING, logger='katdal.dataset'):
+        dataset.select(target_tags=target_tags)
+    if 'incorrect_tag' in target_tags:
+        assert 'Skipping unknown selected target tag' in caplog.text
     assert_array_equal(dataset.dumps, expected_dumps)

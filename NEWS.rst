@@ -1,6 +1,12 @@
 History
 =======
 
+0.23 (2024-06-28)
+-----------------
+* New `mvf_download` script (also promote `mvf_copy` and remove junk) (#380)
+* Select targets by their tags (#377)
+* Rename `np.product` to support numpy >= 2.0 and make unit tests more robust (#372)
+
 0.22 (2023-11-28)
 -----------------
 * Restore np.bool in Numba averaging function to prevent mvftoms crash (#370)

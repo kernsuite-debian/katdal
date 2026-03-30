@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ################################################################################
-# Copyright (c) 2011-2023, National Research Foundation (SARAO)
+# Copyright (c) 2011,2013,2016-2023, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -34,10 +34,10 @@ setup(name='katdal',
       author_email='ludwig@ska.ac.za',
       packages=find_packages(),
       scripts=[
-          'scripts/h5list.py',
-          'scripts/h5toms.py',
+          'scripts/mvf_copy.py',
+          'scripts/mvf_download.py',
           'scripts/mvftoms.py',
-          'scripts/fix_ant_positions.py'],
+      ],
       url='https://github.com/ska-sa/katdal',
       license='Modified BSD',
       classifiers=[
@@ -54,9 +54,18 @@ setup(name='katdal',
       python_requires='>=3.6',
       setup_requires=['katversion'],
       use_katversion=True,
-      install_requires=['numpy >= 1.12.0', 'katpoint >= 0.9, < 1', 'h5py >= 2.3',
-                        'numba', 'katsdptelstate[rdb] >= 0.10', 'dask[array] >= 2.7.0',
-                        'requests >= 2.18.0', 'pyjwt >= 2', 'cityhash >= 0.2.2'],
+      install_requires=[
+          'numpy >= 1.12.0',
+          'katpoint >= 0.9, < 1',
+          'h5py >= 2.3',
+          'numba',
+          'katsdptelstate[rdb] >= 0.10',
+          'dask[array] >= 2.7.0',
+          'requests >= 2.18.0',
+          'pyjwt >= 2',
+          'cityhash >= 0.2.2',
+          'packaging',
+      ],
       extras_require={
           'ms': ['python-casacore >= 2.2.1'],
           's3': [],

@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2018-2023, National Research Foundation (SARAO)
+# Copyright (c) 2018-2022,2024, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -124,7 +124,7 @@ class TestChunkStoreVisFlagsWeights:
         # Put fake dataset into chunk store
         store, chunk_info, data, weights = self._make_basic_dataset()
         index = np.s_[2:5, -20:]
-        vfw = ChunkStoreVisFlagsWeights(store, chunk_info, index=index)
+        vfw = ChunkStoreVisFlagsWeights(store, chunk_info, preselect_index=index)
         assert_array_equal(vfw.vis.compute(), data['correlator_data'][index])
         assert_array_equal(vfw.flags.compute(), data['flags'][index])
         assert_array_equal(vfw.weights.compute(), weights[index])

@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2011-2023, National Research Foundation (SARAO)
+# Copyright (c) 2011-2022, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -135,7 +135,7 @@ def dask_getitem(x, indices):
     # ensure_dict, which copies all the keys, presumably to speed up the
     # case where most keys are retained. A lazy indexer is normally used to
     # fetch a small part of the data.
-    if np.product(out.numblocks) < 0.5 * np.product(x.numblocks):
+    if np.prod(out.numblocks) < 0.5 * np.prod(x.numblocks):
         dsk = dask.optimization.cull(out.dask, out.__dask_keys__())[0]
         out.dask = dask.highlevelgraph.HighLevelGraph.from_collections(out.name, dsk)
     return out

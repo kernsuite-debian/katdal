@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright (c) 2017-2023, National Research Foundation (SARAO)
+# Copyright (c) 2017-2021,2023-2024, National Research Foundation (SARAO)
 #
 # Licensed under the BSD 3-Clause License (the "License"); you may not use
 # this file except in compliance with the License. You may obtain a copy
@@ -394,7 +394,7 @@ class TelstateDataSource(DataSource):
                                              corrprods=telstate['bls_ordering'],
                                              stored_weights_are_scaled=not need_weights_power_scale,
                                              van_vleck=van_vleck,
-                                             index=index)
+                                             preselect_index=index)
 
         if timestamps is None:
             # Synthesise timestamps from the relevant telstate bits
