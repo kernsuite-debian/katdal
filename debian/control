@@ -9,6 +9,7 @@ Build-Depends: debhelper-compat (= 13),
  python3-katversion,
  python3-katpoint,
  python3-casacore,
+ python3-cryptography,
  python3-numpy,
  python3-h5py,
  python3-numba,
@@ -29,7 +30,8 @@ X-Python3-Version: >= 3.12
 Package: python3-katdal
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${python3:Depends},
- python3-casacore, python3-rdbtools, python3-katsdptelstate, python3-katpoint
+ python3-casacore, python3-rdbtools, python3-katsdptelstate,
+ python3-katpoint, python3-cryptography
 Description: Data access library for the MeerKAT project
  This package serves as a data access library to the HDF5 files produced by the
  Fringe Finder, KAT-7 and MeerKAT data capturing systems. It uses memory

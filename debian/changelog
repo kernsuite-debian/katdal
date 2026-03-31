@@ -1,3 +1,10 @@
+katdal (0.23-1kern2) noble; urgency=medium
+
+  [ Athanaseus Javas Ramaila ]
+  * Add Deps
+
+ -- KERN packaging <packaging@kernsuite.info>  Wed, 01 Apr 2026 01:13:45 +0200
+
 katdal (0.23-1kern1) noble; urgency=medium
 
   [ Athanaseus Javas Ramaila ]
