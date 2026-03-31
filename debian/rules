@@ -9,15 +9,3 @@ export PYBUILD_TEST_RUNNER=pytest
 
 %:
 	dh $@ --with python3 --buildsystem=pybuild
-
-#!/usr/bin/make -f
-
-export PYBUILD_NAME=katdal
-
-%:
-	dh $@ --with python3 --buildsystem=pybuild
-
-override_dh_auto_test:
-	# Skip the RDB-dependent test that triggers the katsdptelstate NameError
-	PYBUILD_SYSTEM=custom \
-	PYBUILD_TEST_ARGS="cd {build_dir}; {interpreter} -m pytest -k 'not test_construction_from_url' {dir}/katdal/test" dh_auto_test

@@ -18,7 +18,8 @@ Build-Depends: debhelper-compat (= 13),
  python3-jwt,
  python3-cityhash,
  python3-packaging,
- python3-pytest
+ python3-pytest,
+ python3-rdbtools
 Standards-Version: 4.7.2.0
 Homepage: https://github.com/ska-sa/katdal
 Vcs-Git: git://github.com/kernsuite-debian/katdal.git
@@ -27,7 +28,8 @@ X-Python3-Version: >= 3.12
 
 Package: python3-katdal
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, ${python3:Depends}, python3-casacore
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${python3:Depends},
+ python3-casacore, python3-rdbtools, python3-katsdptelstate, python3-katpoint
 Description: Data access library for the MeerKAT project
  This package serves as a data access library to the HDF5 files produced by the
  Fringe Finder, KAT-7 and MeerKAT data capturing systems. It uses memory
